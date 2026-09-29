@@ -1,0 +1,3 @@
+ifdef CONFIG_OVMS_COMP_TELNET
+COMPONENT_SRCDIRS := src
+endif

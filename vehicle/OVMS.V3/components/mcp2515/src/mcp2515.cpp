@@ -1,0 +1,1140 @@
+/*
+;    Project:       Open Vehicle Monitor System
+;    Date:          14th March 2017
+;
+;    Changes:
+;    1.0  Initial release
+;
+;    (C) 2011       Michael Stegen / Stegen Electronics
+;    (C) 2011-2017  Mark Webb-Johnson
+;    (C) 2011        Sonny Chen @ EPRO/DX
+;
+; Permission is hereby granted, free of charge, to any person obtaining a copy
+; of this software and associated documentation files (the "Software"), to deal
+; in the Software without restriction, including without limitation the rights
+; to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+; copies of the Software, and to permit persons to whom the Software is
+; furnished to do so, subject to the following conditions:
+;
+; The above copyright notice and this permission notice shall be included in
+; all copies or substantial portions of the Software.
+;
+; THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+; IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+; FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+; AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+; LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+; OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+; THE SOFTWARE.
+*/
+
+#include "ovms_log.h"
+static const char *TAG = "mcp2515";
+
+#include <string.h>
+#include "mcp2515.h"
+#include "mcp2515_regdef.h"
+#include "soc/gpio_struct.h"
+#include "driver/gpio.h"
+#include "esp_intr_alloc.h"
+#include "soc/dport_reg.h"
+
+static IRAM_ATTR void MCP2515_isr(void *pvParameters)
+  {
+  mcp2515 *me = (mcp2515*)pvParameters;
+  BaseType_t task_woken = pdFALSE;
+
+  me->m_status.interrupts++;
+
+  // INT is a level signal: the MCP2515 holds it low for as long as any unmasked
+  // CANINTF flag is set, so with GPIO_INTR_LOW_LEVEL configured (see constructor)
+  // this ISR would be re-entered continuously -- an interrupt storm -- for as long
+  // as the line stays low, i.e. until AsynchronousInterruptHandler() has drained
+  // CANINTF over SPI. Mask this pin's interrupt now, before queuing the service
+  // request, so it cannot re-enter while unserviced. Direct register write, not
+  // gpio_intr_disable(): OVMS installs the GPIO ISR service with
+  // ESP_INTR_FLAG_IRAM (main/ovms_peripherals.cpp), so this handler runs in an
+  // IRAM context and may execute while the flash cache is disabled.
+  // gpio_intr_disable() (components/driver/gpio.c) is not IRAM_ATTR in
+  // ESP-IDF v3.3.4 (only gpio_intr_service is) and must not be called from
+  // here -- the direct single-register write below is also cheaper on this
+  // hot ISR path. Re-arming happens in AsynchronousInterruptHandler() once
+  // CANINTF reads back clear.
+  //
+  // Note: gpio_intr_disable() also does gpio_intr_status_clr() (write-1-to-
+  // clear the GPIO status latch) right after int_ena=0; we deliberately skip
+  // that clear here. It's safe: every re-arm path goes through
+  // gpio_intr_enable(), which itself calls gpio_intr_status_clr() BEFORE
+  // setting int_ena (verified in gpio.c), so any stale latch is cleared
+  // exactly at re-enable -- the only moment it matters. Clearing it here at
+  // mask time would be redundant, and pointless while INT is still held low,
+  // since the level-triggered condition would immediately re-latch it.
+  GPIO.pin[me->m_intpin].int_ena = 0;
+
+  // we don't know the IRQ source and querying by SPI is too slow for an ISR,
+  // so we let AsynchronousInterruptHandler() figure out what to do.
+  CAN_queue_msg_t msg = {};
+  msg.type = CAN_asyncinterrupthandler;
+  msg.body.bus = me;
+
+  //send callback request to main CAN processor task
+  if (xQueueSendFromISR(MyCan.m_rxqueue, &msg, &task_woken) != pdTRUE)
+    {
+    // Queue full: the service request was dropped, so nothing will call
+    // AsynchronousInterruptHandler() -> re-arm this bus's GPIO interrupt this time.
+    // This is NOT a lost frame -- the interrupt line is already masked above, so
+    // the raw frame(s) stay safely latched in the MCP2515's own hardware RX
+    // buffers (read over SPI, untouched by this failure) rather than being
+    // dropped. Nothing is silently discarded: count it, and rely on the RX-stall
+    // watchdog (canbus::BusTicker10 / CheckRxStalled(), which polls CANINTF
+    // directly over SPI, independent of GPIO interrupt state) as the backstop --
+    // it will see the still-pending RX flag and call Reset(), whose Start()
+    // unconditionally re-enables this GPIO interrupt as a safety net.
+    me->m_status.isr_queue_overrun++;
+    }
+
+  // Yield to minimize latency if we have woken up a higher priority task:
+  if (task_woken == pdTRUE)
+    {
+    portYIELD_FROM_ISR();
+    }
+  }
+
+mcp2515::mcp2515(const char* name, spi* spibus, spi_host_device_t host, int clockspeed, int cspin, int intpin, bool hw_cs /*=true*/)
+  : canbus(name)
+  {
+  m_spibus = spibus;
+  m_clockspeed = clockspeed;
+  m_cspin = cspin;
+  m_intpin = intpin;
+
+  memset(&m_devcfg, 0, sizeof(spi_device_interface_config_t));
+  m_devcfg.clock_speed_hz=m_clockspeed;     // Clock speed (in hz)
+  m_devcfg.mode=0;                          // SPI mode 0
+  m_devcfg.command_bits=0;
+  m_devcfg.address_bits=0;
+  m_devcfg.dummy_bits=0;
+  //if (hw_cs)
+    m_devcfg.spics_io_num=m_cspin;
+  //else
+  //  {
+    // use software CS for this mcp2515
+  //  m_devcfg.spics_io_num=-1;
+  //  m_devcfg.spics_ext_io_num=m_cspin;
+  //  }
+  m_devcfg.queue_size=7;                    // We want to be able to queue 7 transactions at a time
+
+/********* Use the SPI object to determine if the SPI bus has been initialized *************/
+if (m_spibus->m_initialized == false) {
+  ESP_LOGI(TAG, "  Initializing the SPI object in MC2515");
+    esp_err_t ret = spi_bus_initialize(host, &m_spibus->m_buscfg, 0);
+    assert(ret==ESP_OK);
+    m_spibus->m_host = host;
+    m_spibus->m_initialized = true;
+}
+/********************************/
+  esp_err_t ret = spi_bus_add_device(host,  &m_devcfg, &m_spi);
+  assert(ret==ESP_OK);
+
+  // Probe controller presence: retry once before declaring the controller absent.
+  {
+  uint8_t pbuf[16];
+  uint8_t canstat = 0;
+
+  // Reset first so the config-mode probe starts from the same state as Start().
+  m_spibus->spi_cmd(m_spi, pbuf, 0, 1, CMD_RESET);
+  vTaskDelay(pdMS_TO_TICKS(50));
+
+  for (int attempt = 0; attempt < 2; attempt++)
+    {
+    uint8_t *preg = m_spibus->spi_cmd(m_spi, pbuf, 1, 2, CMD_READ, REG_CANSTAT);
+    canstat = preg[0];
+    if ((canstat & CANCTRL_MODE) == CANCTRL_MODE_CONFIG)
+      {
+      m_hw_present = true;
+      break;
+      }
+    if (attempt == 0)
+      {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      }
+    }
+  if (!m_hw_present)
+    {
+    ESP_LOGE(TAG, "%s: MCP2515 not detected after retry (CANSTAT=0x%02x), disabling this bus", this->GetName(), canstat);
+    }
+  }
+
+  if (m_hw_present)
+    {
+    // INT is a level signal (held low while any unmasked CANINTF flag is set), not an
+    // edge -- GPIO_INTR_NEGEDGE would miss the interrupt entirely if it is ever dropped
+    // (e.g. ISR->task queue full), permanently wedging the RX path since no further edge
+    // would ever arrive. GPIO_INTR_LOW_LEVEL instead keeps re-asserting for as long as
+    // the source is unserviced; see MCP2515_isr() and AsynchronousInterruptHandler() for
+    // the mask/re-arm handshake that keeps this from storming.
+    gpio_set_intr_type((gpio_num_t)m_intpin, GPIO_INTR_LOW_LEVEL);
+    gpio_isr_handler_add((gpio_num_t)m_intpin, MCP2515_isr, (void*)this);
+    }
+  gpio_intr_disable((gpio_num_t)m_intpin);
+
+  // Initialise in powered down mode
+  m_canctrl_mode = CANCTRL_MODE_CONFIG; // MCP2515 mode after reset
+  m_powermode = Off; // Stop an event being raised
+  SetPowerMode(Off);
+  if (m_hw_present)
+    SetTransceiverMode(CAN_MODE_LISTEN);
+
+  // Register mcp2515 specific commands:
+  OvmsCommand* cmd_can = MyCommandApp.RegisterCommand("can", "CAN framework");
+  m_cmd_canx = cmd_can->RegisterCommand(name, "CANx framework");
+  m_cmd_canx->RegisterCommand("setaccfilter", "Set MCP2515 acceptance filter", shell_setaccfilter,
+    "<mask0> <filter0> <filter1> <mask1> <filter2> <filter3> <filter4> <filter5>\n"
+    "Specify masks and filters as 32 bit hexadecimal values.\n"
+    "All arguments default to 0 = no filter.\n"
+    "To disable all filters, call without arguments.\n"
+    "Bit layout: see MCP2515 specification, section 4.5 Acceptance Filter.",
+    0, 8);
+  }
+
+mcp2515::~mcp2515()
+  {
+  m_cmd_canx->GetParent()->UnregisterCommand(m_cmd_canx->GetName());
+  if (m_hw_present)
+    {
+    SetTransceiverMode(CAN_MODE_LISTEN);
+    gpio_isr_handler_remove((gpio_num_t)m_intpin);
+    }
+  spi_bus_remove_device(m_spi);
+  }
+
+
+esp_err_t mcp2515::WriteReg( uint8_t reg, uint8_t value )
+  {
+  uint8_t buf[16];
+  m_spibus->spi_cmd(m_spi, buf, 0, 3, CMD_WRITE, reg, value);
+  return ESP_OK;
+  }
+
+esp_err_t mcp2515::WriteRegAndVerify( uint8_t reg, uint8_t value, uint8_t read_back_mask )
+  {
+  uint8_t buf[16];
+  uint8_t * rcvbuf;
+  uint16_t timeout = 0;
+
+  rcvbuf = m_spibus->spi_cmd(m_spi, buf, 1, 2, CMD_READ, reg);
+  uint8_t origval = rcvbuf[0];
+  ESP_LOGD(TAG, "%s: Set register (0x%02x val 0x%02x->0x%02x)", this->GetName(), reg, origval, value);
+
+  WriteReg( reg, value );
+
+  // verify that register is actually changed by reading it back.
+  do
+    {
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+
+    rcvbuf = m_spibus->spi_cmd(m_spi, buf, 1, 2, CMD_READ, reg);
+    rcvbuf[0] &= read_back_mask; // we check for consistency only these bits (we couldn't change some read-only bits)
+    ESP_LOGD(TAG, "%s:  - read register (0x%02x : 0x%02x)", this->GetName(), reg, rcvbuf[0]);
+    timeout += 10;
+    } while ( (rcvbuf[0] != value) && (timeout < MCP2515_TIMEOUT) );
+
+  if (timeout >= MCP2515_TIMEOUT)
+    {
+    ESP_LOGE(TAG, "%s: Could not set register (0x%02x to val 0x%02x)", this->GetName(), reg, value);
+    return ESP_FAIL;
+    }
+  return ESP_OK;
+  }
+
+
+esp_err_t mcp2515::Start(CAN_mode_t mode, CAN_speed_t speed)
+  {
+  if (!m_hw_present)
+    {
+    ESP_LOGW(TAG, "%s: Start requested but MCP2515 is unavailable", this->GetName());
+    return ESP_FAIL;
+    }
+
+  // Restarting an already started bus (e.g. for mode change)?
+  if (m_mode != CAN_MODE_OFF)
+    {
+    Stop();
+    }
+
+  canbus::Start(mode, speed);
+  uint8_t buf[16];
+
+  m_mode = mode;
+  m_speed = speed;
+
+  // RESET commmand
+  m_spibus->spi_cmd(m_spi, buf, 0, 1, CMD_RESET);
+  vTaskDelay(50 / portTICK_PERIOD_MS);
+
+  // CANINTE (interrupt enable), disable all interrupts during configuration
+  WriteRegAndVerify(REG_CANINTE, 0);
+
+  // Set CONFIG mode (abort transmisions, one-shot mode, clkout disabled)
+  WriteReg(REG_CANCTRL, CANCTRL_MODE_CONFIG | CANCTRL_ABAT | CANCTRL_OSM);
+  m_canctrl_mode = CANCTRL_MODE_CONFIG;
+
+
+  // Disable filter checking and enable buffer 1 rollover
+  EnableRXFilter(false);
+  
+  SetTransceiverMode(mode);
+
+  // Bus speed
+  uint8_t cnf1 = 0;
+  uint8_t cnf2 = 0;
+  uint8_t cnf3 = 0;
+  switch (m_speed)
+    {
+    case CAN_SPEED_33KBPS:
+      // Recommended SWCAN settings according to GMLAN specs (GMW3089): SJW=2 and Sample Point = 86,67%
+      cnf1=0x4f; // SJW=2, BRP=15
+      cnf2=0xad; // BTLMODE=1, SAM=0,  PHSEG1=5 (6 Tq), PRSEG=5 (6 Tq)
+      cnf3=0x81; // SOF=1, WAKFIL=0, PHSEG2=1 (2 tQ)
+      break;
+    case CAN_SPEED_50KBPS:
+      cnf1=0x87; cnf2=0xff; cnf3=0x82;
+      // BRP=7, PRSEG=7, PHSEG1=7, PHSEG2=2, SJW=2, BTLMODE=1, SAM=1, SOF=1, WAKFIL=0 → Sample point at 17/20 = 85%
+      // Other options:
+      //cnf1=0x07; cnf2=0xfa; cnf3=0x87;
+      // BRP=7, PRSEG=2, PHSEG1=7, PHSEG2=7, SJW=0, BTLMODE=1, SAM=1, SOF=1, WAKFIL=0 → Sample point at 12/20 = 60%
+      //cnf1=0x47; cnf2=0xfa; cnf3=0x87;
+      // BRP=7, PRSEG=2, PHSEG1=7, PHSEG2=7, SJW=1, BTLMODE=1, SAM=1, SOF=1, WAKFIL=0 (same, raised SJW)
+      //cnf1=0x47; cnf2=0xf6; cnf3=0x84;
+      // BRP=7, PRSEG=6, PHSEG1=6, PHSEG2=4, SJW=1, BTLMODE=1, SAM=1, SOF=1, WAKFIL=0 → Sample point at 15/20 = 75%
+      // (taken from MCP_CAN library)
+      break;
+    case CAN_SPEED_83KBPS:
+      cnf1=0x03; cnf2=0xbe; cnf3=0x07;
+      // BRP=3, PRSEG=6, PS1=7, PS2=7, SJW=0, BTLMODE=1, SAM=0, SOF=0, WAKFIL=0
+      // … this should not work at all as 83.333 kBps? Anyone using this?
+      break;
+    case CAN_SPEED_100KBPS:
+      cnf1=0x03; cnf2=0xfa; cnf3=0x87;
+      // BRP=3, PRSEG=2, PS1=7, PS2=7, SJW=0, BTLMODE=1, SAM=1, SOF=1, WAKFIL=0 → Sample point at 9/16 = 56,25%
+      break;
+    case CAN_SPEED_125KBPS:
+      cnf1=0x03; cnf2=0xf0; cnf3=0x86;
+      // BRP=3, PRSEG=0, PS1=6, PS2=6, SJW=0, BTLMODE=1, SAM=1, SOF=1, WAKFIL=0 → Sample point at 9/16 = 56,25%
+      break;
+    case CAN_SPEED_250KBPS:
+      cnf1=0x41; cnf2=0xf1; cnf3=0x85;
+      break;
+    case CAN_SPEED_500KBPS:
+      cnf1=0x00; cnf2=0xf0; cnf3=0x86;
+      break;
+    case CAN_SPEED_1000KBPS:
+      cnf1=0x00; cnf2=0xca; cnf3=0x81;
+      break;
+    }
+  m_spibus->spi_cmd(m_spi, buf, 0, 5, CMD_WRITE, REG_CNF3, cnf3, cnf2, cnf1);
+
+  // Active/Listen Mode
+  uint8_t ret;
+  if (m_mode == CAN_MODE_LISTEN)
+    ret=ChangeMode(CANCTRL_MODE_LISTEN);
+  else
+    ret=ChangeMode(CANCTRL_MODE_NORMAL);
+  if (ret != ESP_OK)
+      return ESP_FAIL;
+
+  // Clear abort transmisions & one-shot mode:
+  m_spibus->spi_cmd(m_spi, buf, 0, 4, CMD_BITMODIFY, REG_CANCTRL, CANCTRL_OSM | CANCTRL_ABAT, 0);
+
+  // finally verify configuration registers
+  uint8_t * rcvbuf = m_spibus->spi_cmd(m_spi, buf, 3, 2, CMD_READ, REG_CNF3);
+  if ( (cnf1!=rcvbuf[2]) or (cnf2!=rcvbuf[1]) or (cnf3!=rcvbuf[0]) )
+    {
+    ESP_LOGE(TAG, "%s: could not change configuration registers! (read CNF 0x%02x 0x%02x 0x%02x)", this->GetName(),
+      rcvbuf[2], rcvbuf[1], rcvbuf[0]);
+    return ESP_FAIL;
+    }
+
+  // CANINTE (interrupt enable), all interrupts
+  WriteReg(REG_CANINTE, 0b11111111);
+
+  // And record that we are powered on
+  if (GetPowerMode() != On)
+    {
+    ESP_LOGI(TAG, "%s: Started, SetPowerMode on", this->GetName());
+    }
+  pcp::SetPowerMode(On);
+
+  // Safety net: unconditionally re-arm the GPIO level interrupt on every (re)start.
+  // Normally it is re-armed by AsynchronousInterruptHandler() once drained; this
+  // covers the rare case where that path never ran (e.g. ISR->task queue was full
+  // and the service ping got dropped) by restoring a known-good state whenever the
+  // bus is (re)started, including the RX-stall watchdog's Reset()->Start() path.
+  // Must stay after the power publish above: Start() is the only re-arm
+  // path — the handler's guard only masks, never re-arms — so arming first
+  // here loses the race on every Start(), causing the indefinite re-wedge loop.
+  gpio_intr_enable((gpio_num_t)m_intpin);
+
+  return ESP_OK;
+  }
+
+
+esp_err_t mcp2515::ChangeMode( uint8_t mode )
+  {
+  uint8_t buf[16];
+  uint8_t * rcvbuf;
+  uint16_t timeout = 0;
+
+  ESP_LOGD(TAG, "%s: Change op mode to 0x%02x", this->GetName(), mode);
+
+  m_spibus->spi_cmd(m_spi, buf, 0, 4, CMD_BITMODIFY, REG_CANCTRL, CANCTRL_MODE, mode);
+
+  // verify that mode is changed by polling CANSTAT register
+  do
+    {
+    vTaskDelay(20 / portTICK_PERIOD_MS);
+
+    rcvbuf = m_spibus->spi_cmd(m_spi, buf, 1, 2, CMD_READ, REG_CANSTAT);
+    ESP_LOGD(TAG, "%s:  read CANSTAT register (0x%02x : 0x%02x)", this->GetName(), REG_CANSTAT, rcvbuf[0]);
+    timeout += 20;
+
+    } while ( ((rcvbuf[0] & CANCTRL_MODE) != mode) && (timeout < MCP2515_TIMEOUT) );
+
+  if (timeout >= MCP2515_TIMEOUT)
+    {
+    ESP_LOGE(TAG, "%s: Could not change mode to 0x%02x", this->GetName(), mode);
+    return ESP_FAIL;
+    }
+
+  m_canctrl_mode = mode;
+  return ESP_OK;
+  }
+
+
+esp_err_t mcp2515::Stop()
+  {
+  if (!m_hw_present)
+    {
+    gpio_intr_disable((gpio_num_t)m_intpin);
+    pcp::SetPowerMode(Off);
+    m_mode = CAN_MODE_OFF;
+    return ESP_OK;
+    }
+
+  // If already off, keep IRQ masked and skip all SPI transactions.
+  if (m_mode == CAN_MODE_OFF)
+    {
+    gpio_intr_disable((gpio_num_t)m_intpin);
+    pcp::SetPowerMode(Off);
+    return ESP_OK;
+    }
+
+  canbus::Stop();
+
+  // Keep IRQ masked while stopped/unpowered; Start() re-enables after init.
+  gpio_intr_disable((gpio_num_t)m_intpin);
+
+  uint8_t buf[16];
+
+  // RESET command
+  m_spibus->spi_cmd(m_spi, buf, 0, 1, CMD_RESET);
+  vTaskDelay(50 / portTICK_PERIOD_MS);
+
+  SetTransceiverMode(CAN_MODE_LISTEN);
+
+  // Set SLEEP mode
+  ChangeMode(CANCTRL_MODE_SLEEP);
+
+  // And record that we are powered down
+  pcp::SetPowerMode(Off);
+  m_mode = CAN_MODE_OFF;
+
+  return ESP_OK;
+  }
+
+// Filter logic is such that if enabled mask and filters 0, 1 are
+// applied to RX buffer 0, and mask 1 and filters 2-5 are applied to RX buffer 0.
+// If a packet matches Filters 0, 1 then it is placed in RX buffer 0,
+// otherwise if it matches Filters 2-5 then it is placed in RX buffer 1.
+//
+// If RX Buffer 0 is full and if roll over is enabled then the packet
+// will be placed in RX Buffer 1 regardless of if it matched the Filters 2-5.
+//
+// Roll over from RXB0 to RXB1 is always enabled.
+esp_err_t mcp2515::EnableRXFilter(bool enable)
+  {
+  bool success = false;
+
+  if (enable)
+    {
+    success = (WriteRegAndVerify(REG_RXB0CTRL, 0b00000100, 0b01100100) == ESP_OK &&
+               WriteRegAndVerify(REG_RXB1CTRL, 0b00000000, 0b01100000) == ESP_OK);
+    }
+
+  else
+    {
+    success = (WriteRegAndVerify(REG_RXB0CTRL, 0b01100100, 0b01100100) == ESP_OK &&
+               WriteRegAndVerify(REG_RXB1CTRL, 0b01100000, 0b01100000) == ESP_OK);
+    }
+
+  if (!success)
+    {
+    ESP_LOGE(TAG, "%s: Could not %s RX filter", this->GetName(), enable ? "enable" : "disable");
+    return ESP_FAIL;
+    }
+  else
+    {
+    return ESP_OK;
+    }
+  }
+
+
+
+/**
+ * SetAcceptanceFilter: configure MCP2515 specific hardware RX filter
+ * 
+ * Call this via casting the bus to mcp2515 or via MyPeripherals->m_mcp2515_1/_2.
+ * 
+ * See MCP2515 specification section 4.5 on how to define acceptance filters.
+ * 
+ * The MCP2515 has 6 filters, but only 2 masks. Mask #0 is applied to filters
+ * #0-1, mask #1 to filters #2-5. Each filter can only be in either standard
+ * or extended frame mode. In standard frame mode, the lower 16 bits of the
+ * extended ID can be applied to the first two data bytes.
+ * 
+ * The mcp2515_filter_config_t includes bit fields for simplified assembly, e.g.:
+ *   cfg.filter[0].b.sid = 0x19f;
+ *   cfg.mask[0].b.sid = 0x7ff;
+ * 
+ * Att: filter bits become relevant by setting the corresponding mask bit to 1.
+ */
+esp_err_t mcp2515::SetAcceptanceFilter(const mcp2515_filter_config_t& cfg)
+  {
+  uint8_t buf[16];
+
+  // Block TX in case of filter reconfiguration while started
+  OvmsMutexLock lock(&m_write_mutex);
+
+  // Enter config mode
+  uint8_t prev_mode = m_canctrl_mode;
+  if (prev_mode != CANCTRL_MODE_CONFIG && ChangeMode(CANCTRL_MODE_CONFIG) != ESP_OK)
+    {
+    return ESP_FAIL;
+    }
+
+  bool filters_cleared = (cfg.mask[0].u32 == 0 && cfg.mask[1].u32 == 0 &&
+                    cfg.filter[0].u32 == 0 && cfg.filter[1].u32 == 0 &&
+                    cfg.filter[2].u32 == 0 && cfg.filter[3].u32 == 0 &&
+                    cfg.filter[4].u32 == 0 && cfg.filter[5].u32 == 0);
+            
+  // There is nothing in the MCP2515 datasheet that says that this needs
+  // to be done in config mode but it seems to be a good idea to do so.                    
+  EnableRXFilter(!filters_cleared);
+  
+  // Write filters 0-2:
+  m_spibus->spi_cmd(m_spi, buf, 0, 14, CMD_WRITE, REG_RXF0SIDH,
+    cfg.filter[0].u8[3], cfg.filter[0].u8[2], cfg.filter[0].u8[1],cfg.filter[0].u8[0],
+    cfg.filter[1].u8[3], cfg.filter[1].u8[2], cfg.filter[1].u8[1],cfg.filter[1].u8[0],
+    cfg.filter[2].u8[3], cfg.filter[2].u8[2], cfg.filter[2].u8[1],cfg.filter[2].u8[0]);
+
+  // Write filters 3-5:
+  m_spibus->spi_cmd(m_spi, buf, 0, 14, CMD_WRITE, REG_RXF3SIDH,
+    cfg.filter[3].u8[3], cfg.filter[3].u8[2], cfg.filter[3].u8[1],cfg.filter[3].u8[0],
+    cfg.filter[4].u8[3], cfg.filter[4].u8[2], cfg.filter[4].u8[1],cfg.filter[4].u8[0],
+    cfg.filter[5].u8[3], cfg.filter[5].u8[2], cfg.filter[5].u8[1],cfg.filter[5].u8[0]);
+
+  // Write masks 0-1:
+  m_spibus->spi_cmd(m_spi, buf, 0, 10, CMD_WRITE, REG_RXM0SIDH,
+    cfg.mask[0].u8[3], cfg.mask[0].u8[2], cfg.mask[0].u8[1],cfg.mask[0].u8[0],
+    cfg.mask[1].u8[3], cfg.mask[1].u8[2], cfg.mask[1].u8[1],cfg.mask[1].u8[0]);
+
+  // Exit config mode
+  if (prev_mode != CANCTRL_MODE_CONFIG && ChangeMode(prev_mode) != ESP_OK)
+    {
+    return ESP_FAIL;
+    }
+
+  return ESP_OK;
+  }
+
+
+/**
+ * shell_setaccfilter: shell command wrapper for SetAcceptanceFilter()
+ * 
+ * Syntax: can <bus> setaccfilter <msk0> <flt0> <flt1> <msk1> <flt2> <flt3> <flt4> <flt5>
+ */
+void mcp2515::shell_setaccfilter(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int argc, const char* const* argv)
+  {
+  const char* bus = cmd->GetParent()->GetName();
+  mcp2515* sbus = (mcp2515*)MyPcpApp.FindDeviceByName(bus);
+  if (sbus == NULL)
+    {
+    writer->printf("ERROR: cannot find CAN bus %s\n", bus);
+    return;
+    }
+
+  mcp2515_filter_config_t cfg = {};
+  if (argc >= 1) cfg.mask[0].u32 = strtoul(argv[0], NULL, 16);
+  if (argc >= 2) cfg.filter[0].u32 = strtoul(argv[1], NULL, 16);
+  if (argc >= 3) cfg.filter[1].u32 = strtoul(argv[2], NULL, 16);
+  if (argc >= 4) cfg.mask[1].u32 = strtoul(argv[3], NULL, 16);
+  if (argc >= 5) cfg.filter[2].u32 = strtoul(argv[4], NULL, 16);
+  if (argc >= 6) cfg.filter[3].u32 = strtoul(argv[5], NULL, 16);
+  if (argc >= 7) cfg.filter[4].u32 = strtoul(argv[6], NULL, 16);
+  if (argc >= 8) cfg.filter[5].u32 = strtoul(argv[7], NULL, 16);
+  
+  esp_err_t res = sbus->SetAcceptanceFilter(cfg);
+  if (res == ESP_OK)
+    {
+    writer->printf("Acceptance filter for %s set to:\n"
+      "- mask 1: %08X filters %08X,%08X\n"
+      "- mask 2: %08X filters %08X,%08X,%08X,%08X\n",
+      bus,
+      cfg.mask[0].u32, cfg.filter[0].u32, cfg.filter[1].u32,
+      cfg.mask[1].u32, cfg.filter[2].u32, cfg.filter[3].u32,
+                       cfg.filter[4].u32, cfg.filter[5].u32);
+    }
+  else
+    {
+    writer->printf("ERROR: failed to configure acceptance filter for %s\n", bus);
+    }
+  }
+
+
+esp_err_t mcp2515::ViewRegisters()
+  {
+  uint8_t buf[20];
+  uint8_t cnf[3];
+  // fetch configuration registers
+  uint8_t * rcvbuf = m_spibus->spi_cmd(m_spi, buf, 9, 2, CMD_READ, REG_CNF3);
+  cnf[0] = rcvbuf[2];
+  cnf[1] = rcvbuf[1];
+  cnf[2] = rcvbuf[0];
+  ESP_LOGI(TAG,
+    "%s: configuration registers: CNF 0x%02x 0x%02x 0x%02x",
+    this->GetName(), cnf[0], cnf[1], cnf[2]);
+  ESP_LOGI(TAG,
+    "%s: CANINTE 0x%02x CANINTF 0x%02x EFLG 0x%02x CANSTAT 0x%02x CANCTRL 0x%02x TXB0CTRL 0x%02x",
+    this->GetName(), rcvbuf[3], rcvbuf[4], rcvbuf[5], rcvbuf[6], rcvbuf[7], rcvbuf[8]);
+  // read error counters
+  rcvbuf = m_spibus->spi_cmd(m_spi, buf, 2, 2, CMD_READ, REG_TEC);
+  uint8_t errors_tx = rcvbuf[0];
+  uint8_t errors_rx = rcvbuf[1];
+  ESP_LOGI(TAG, "%s: tx_errors: 0x%02x. rx_errors: 0x%02x", this->GetName(),
+      errors_tx, errors_rx);
+  rcvbuf = m_spibus->spi_cmd(m_spi, buf, 1, 2, CMD_READ, REG_BFPCTRL);
+  ESP_LOGI(TAG, "%s: BFPCTRL 0x%02x", this->GetName(), rcvbuf[0]);
+  return ESP_OK;
+  }
+
+
+/**
+ * CheckRxStalled: hardware confirmation of a wedged RX path
+ *
+ * Called by the framework's stall watchdog (canbus::BusTicker10) only after
+ * the RX packet counter has been frozen for the check interval. Reads
+ * CANINTF via SPI (slow path, not the hot ISR/drain path) and reports a wedge
+ * only if a RX buffer full flag is set and thus not currently being serviced
+ * by AsynchronousInterruptHandler(). Pure RX silence (RX0IF/RX1IF clear) is
+ * NOT a stall -- the bus may simply be asleep (e.g. KCAN with car off).
+ */
+bool mcp2515::CheckRxStalled()
+  {
+  if (!m_hw_present)
+    {
+    return false;
+    }
+
+  uint8_t buf[16];
+  uint8_t *p = m_spibus->spi_cmd(m_spi, buf, 1, 2, CMD_READ, REG_CANINTF);
+  uint8_t intstat = p[0];
+  return (intstat & (CANINTF_RX0IF | CANINTF_RX1IF)) != 0;
+  }
+
+
+/**
+ * WriteFrame: deliver a frame to the hardware for transmission (driver internal)
+ */
+esp_err_t mcp2515::WriteFrame(const CAN_frame_t* p_frame)
+  {
+  uint8_t buf[16];
+  uint8_t id[4];
+
+  // check for free TX buffer:
+  uint8_t txbuf;
+  uint8_t* p = m_spibus->spi_cmd(m_spi, buf, 1, 1, CMD_READ_STATUS);
+
+  if ((p[0] & 0b01010100) == 0)  // any buffers busy?
+    txbuf = 0b000;  // all clear - use TxB0
+  else
+    return ESP_FAIL;
+
+  if (p_frame->FIR.B.FF == CAN_frame_std)
+    {
+    // Transmit a standard frame
+    id[0] = p_frame->MsgID >> 3;     // HIGH 8 bits of standard ID
+    id[1] = p_frame->MsgID << 5;     // LOW 3 bits of standard ID
+    id[2] = 0;
+    id[3] = 0;
+    }
+  else
+    {
+    // Transmit an extended frame
+    id[0] = (p_frame->MsgID >> 21) & 0xff;    // HIGH bits
+    id[1] = ((p_frame->MsgID >> 13) & 0xe0)   // Next middle bits of extended ID; set the EXT bit too.
+          + ((p_frame->MsgID >> 16) & 0x03)
+          + 0x08;
+    id[2] = (p_frame->MsgID >> 8) & 0xff;     // MID 8 bits of extended ID
+    id[3] = (p_frame->MsgID & 0xff);          // LOW 8 bits of extended ID
+    }
+
+  // MCP2515 load transmit buffer:
+  m_spibus->spi_cmd(m_spi, buf, 0, 14, CMD_LOAD_TXBUF | txbuf,
+    id[0], id[1], id[2], id[3], p_frame->FIR.B.DLC,
+    p_frame->data.u8[0],
+    p_frame->data.u8[1],
+    p_frame->data.u8[2],
+    p_frame->data.u8[3],
+    p_frame->data.u8[4],
+    p_frame->data.u8[5],
+    p_frame->data.u8[6],
+    p_frame->data.u8[7]);
+
+  // MCP2515 request to send:
+  m_spibus->spi_cmd(m_spi, buf, 0, 1, CMD_RTS | (txbuf ? txbuf : 0b001));
+
+  return ESP_OK;
+  }
+
+
+/**
+ * Write: transmit or queue a frame for transmission (API)
+ */
+esp_err_t mcp2515::Write(const CAN_frame_t* p_frame, TickType_t maxqueuewait /*=0*/)
+  {
+  OvmsMutexLock lock(&m_write_mutex);
+
+  if (m_mode != CAN_MODE_ACTIVE)
+    {
+    ESP_LOGW(TAG,"Cannot write %s when not in ACTIVE mode",m_name);
+    return ESP_FAIL;
+    }
+
+  // if there are frames waiting in the TX queue, add the new one there as well:
+  if (uxQueueMessagesWaiting(m_txqueue))
+    {
+    return QueueWrite(p_frame, maxqueuewait);
+    }
+
+  // try to deliver the frame to the hardware:
+  if (WriteFrame(p_frame) != ESP_OK)
+    {
+    return QueueWrite(p_frame, maxqueuewait);
+    }
+
+  // OK, stats & logging:
+  canbus::Write(p_frame, maxqueuewait);
+
+  return ESP_OK;
+  }
+
+
+// This function serves as asynchronous interrupt handler for both rx and tx tasks as well as error states
+// Returns true if this function needs to be called again (another frame may need handling or all error interrupts are not yet handled)
+bool mcp2515::AsynchronousInterruptHandler(CAN_frame_t* frame, uint32_t* framesReceived)
+  {
+  uint8_t buf[16];
+
+  *framesReceived = 0;
+  CAN_log_type_t log_status = CAN_LogNone;
+
+  if (!m_hw_present)
+    {
+    gpio_intr_disable((gpio_num_t)m_intpin);
+    return false;
+    }
+
+  // Spurious queued service requests can still exist while bus power is off.
+  // Never re-arm or service IRQs unless the bus is actually started and powered.
+  if (m_mode == CAN_MODE_OFF || GetPowerMode() != On)
+    {
+    gpio_intr_disable((gpio_num_t)m_intpin);
+    return false;
+    }
+
+  // read interrupts (CANINTF 0x2c), errors (EFLG 0x2d) and transmission status (TXB0CTRL 0x30):
+  uint8_t *p = m_spibus->spi_cmd(m_spi, buf, 5, 2, CMD_READ, REG_CANINTF);
+  uint8_t intstat = p[0];
+  uint8_t errflag = p[1];
+  uint8_t txb0ctrl = p[4];
+
+  // Invariant: whoever returns false (drain loop ends) with INT deasserted must
+  // re-arm the GPIO interrupt here -- there are two such exit points below (this
+  // early "nothing pending" return, and the final pin-level check at the bottom
+  // of the function), and both must re-arm. Re-enabling any earlier, while a flag
+  // we have not yet serviced could still be asserted, would let the ISR storm
+  // again immediately. Each mcp2515 instance owns a dedicated INT GPIO (see
+  // ovms_peripherals.cpp: can2/can3 use distinct VSPI_PIN_MCP2515_*_INT pins),
+  // so re-arming this pin can never re-enable while a sibling instance on a
+  // shared line is still asserting -- there is no shared line in this topology.
+  if (intstat == 0)
+    {
+    // All interrupts handled: CANINTF read back clear, so INT is already high.
+    if (m_mode != CAN_MODE_OFF && GetPowerMode() == On)
+      {
+      gpio_intr_enable((gpio_num_t)m_intpin);
+      }
+    return false;
+    }
+
+  // handle RX buffers and other interrupts sequentially:
+  int intflag;
+  if (intstat & CANINTF_RX0IF)
+    {
+    // RX buffer 0 is full, handle it
+    intflag = 0x01;
+    }
+  else if (intstat & CANINTF_RX1IF)
+    {
+    // RX buffer 1 is full, handle it
+    intflag = 0x02;
+    }
+  else
+    {
+    // other interrupts:
+    intflag = intstat;
+    }
+
+  m_status.error_flags = (intstat << 24) | (errflag << 16) | intflag;
+
+  if (intflag <= 2)
+    {
+    // The indicated RX buffer has a message to be read
+    memset(frame,0,sizeof(*frame));
+    frame->origin = this;
+
+    // read RX buffer and clear interrupt flag:
+    uint8_t *p = m_spibus->spi_cmd(m_spi, buf, 13, 1, CMD_READ_RXBUF + ((intflag==1) ? 0 : 4));
+
+    if (p[1] & 0x08) //check for extended mode=1, or std mode=0
+      {
+      frame->FIR.B.FF = CAN_frame_ext;           // Extended mode
+      frame->MsgID = ((uint32_t)p[0]<<21)
+                    + (((uint32_t)p[1]&0xe0)<<13)
+                    + (((uint32_t)p[1]&0x03)<<16)
+                    + ((uint32_t)p[2]<<8)
+                    + ((uint32_t)p[3]);
+      }
+    else
+      {
+      frame->FIR.B.FF = CAN_frame_std;
+      frame->MsgID = ((uint32_t)p[0] << 3) + (p[1] >> 5);  // Standard mode
+      }
+
+    frame->FIR.B.DLC = p[4] & 0x0f;
+
+    memcpy(&frame->data,p+5,8);
+    *framesReceived = *framesReceived + 1;
+    MyCan.IncomingFrame(frame);
+    }
+
+  // handle other interrupts that came in at the same time:
+
+  if (intstat & CANINTF_TX012IF)
+    {
+    // TX buffer(s) have become available; clear IRQs and fill up:
+    m_spibus->spi_cmd(m_spi, buf, 0, 4, CMD_BITMODIFY, REG_CANINTF, intstat & CANINTF_TX012IF, 0);
+    m_status.error_flags |= 0x0100;
+
+    // Note: the TXnIF bits only get set on successful transmission (see TX flowchart)
+    // Queue "tx success" callback:
+    CAN_queue_msg_t msg;
+    msg.type = CAN_txcallback;
+    msg.body.frame = m_tx_frame;
+    msg.body.bus = this;
+    xQueueSend(MyCan.m_rxqueue, &msg, 0);
+    }
+
+  if (intstat & (CANINTF_MERRF | CANINTF_WAKIF | CANINTF_ERRIF))
+    {
+    // Error interrupts:
+    //  MERRF = message tx/rx error
+    //  WAKIF = wakeup
+    //  ERRIF = overflow / error state change (details in errflag)
+
+    // Check for RX overflow:
+    if (errflag & EFLG_RX1OVR) // RXB1 overflow
+      {
+      m_status.rxbuf_overflow++;
+      m_status.error_flags |= 0x0200;
+      //ESP_LOGW(TAG, "CAN Bus 2/3 receive overflow; Frame lost.");
+      log_status = CAN_LogStatus_Error;
+      }
+    if (errflag & EFLG_RX0OVR) // RXB0 overflow.  No data lost in this case (it went into RXB1)
+      {
+      m_status.error_flags |= 0x0400;
+      }
+
+    // Read error counters:
+    p = m_spibus->spi_cmd(m_spi, buf, 2, 2, CMD_READ, REG_TEC);
+    m_status.errors_tx = p[0];
+    m_status.errors_rx = p[1];
+    if (errflag & EFLG_TXBO)
+      {
+      m_status.errors_tx |= 0x100;
+      m_status.errors_rx |= 0x100;
+      }
+
+    // Check for TX failure:
+    //  We consider the TX to have failed if a bus error is detected during the
+    //  transmission attempt and the controller gave up on retrying (= entered
+    //  passive mode, txerr >= 128).
+    if ((intstat & CANINTF_MERRF) != 0 &&
+        (txb0ctrl & TXBCTRL_TXREQ) != 0 &&
+        m_status.errors_tx >= 128)
+      {
+      //ESP_LOGE(TAG, "AsynchronousInterruptHandler: error while sending frame. msgId 0x%x", m_tx_frame.MsgID);
+
+      // Abort TX to cancel further retransmission attempts:
+      // … set ABAT, poll for TXREQ to become clear, clear ABAT:
+      m_spibus->spi_cmd(m_spi, buf, 0, 4, CMD_BITMODIFY, REG_CANCTRL, CANCTRL_ABAT, CANCTRL_ABAT);
+      do
+        p = m_spibus->spi_cmd(m_spi, buf, 1, 1, CMD_READ_STATUS);
+      while (p[0] & STATUS_TX012REQ);
+      m_spibus->spi_cmd(m_spi, buf, 0, 4, CMD_BITMODIFY, REG_CANCTRL, CANCTRL_ABAT, 0);
+
+      // … get TXERR & ABTF flags:
+      p = m_spibus->spi_cmd(m_spi, buf, 1, 2, CMD_READ, REG_TXB0CTRL);
+      bool tx_aborted = ((p[0] & (TXBCTRL_ABTF | TXBCTRL_TXERR)) != 0);
+
+      // … and clear TX IRQs in case the abort request came too late:
+      m_spibus->spi_cmd(m_spi, buf, 0, 4, CMD_BITMODIFY, REG_CANINTF, CANINTF_TX012IF, 0);
+
+      // Queue TX callback:
+      CAN_queue_msg_t msg;
+      msg.type = tx_aborted ? CAN_txfailedcallback : CAN_txcallback;
+      msg.body.frame = m_tx_frame;
+      msg.body.bus = this;
+      xQueueSend(MyCan.m_rxqueue, &msg, 0);
+      // …which will log the error as well
+      }
+    else
+      {
+      // Request log entry for other errors:
+      log_status = CAN_LogStatus_Error;
+      }
+    }
+  else
+    {
+    // No error interrupt signaled, but we want to follow the error recovery:
+    if (m_status.errors_tx || m_status.errors_rx)
+      {
+      // Read error counters:
+      p = m_spibus->spi_cmd(m_spi, buf, 2, 2, CMD_READ, REG_TEC);
+      m_status.errors_tx = p[0];
+      m_status.errors_rx = p[1];
+      if (errflag & EFLG_TXBO)
+        {
+        m_status.errors_tx |= 0x100;
+        m_status.errors_rx |= 0x100;
+        }
+      if (!m_status.errors_tx && !m_status.errors_rx)
+        m_status.error_flags = 0;
+      }
+    }
+
+  // clear RX buffer overflow flags:
+  if (errflag & EFLG_RX01OVR)
+    {
+    m_status.error_flags |= 0x0800;
+    m_spibus->spi_cmd(m_spi, buf, 0, 4, CMD_BITMODIFY, REG_EFLG, errflag & EFLG_RX01OVR, 0);
+    }
+
+  // Log bus error state change:
+  uint8_t log_errflag = errflag & ~EFLG_RX01OVR;
+  if (log_errflag && log_errflag != m_last_errflag)
+    {
+    ESP_LOGW(TAG, "%s EFLG: %s%s%s%s%s%s", this->GetName(),
+      (errflag & EFLG_TXBO)  ? "Bus-off " : "",
+      (errflag & EFLG_TXEP)  ? "TX_Err_Passv " : "",
+      (errflag & EFLG_RXEP)  ? "RX_Err_Passv " : "",
+      (errflag & EFLG_TXWAR) ? "TX_Err_Warn " : "",
+      (errflag & EFLG_RXWAR) ? "RX_Err_Warn " : "",
+      (errflag & EFLG_EWARN) ? "EWARN " : "" );
+    }
+  if (log_errflag == 0 && (m_last_errflag & ~EFLG_RX01OVR) != 0)
+    {
+    // Recovered:
+    log_status = CAN_LogStatus_Statistics;
+    }
+  m_last_errflag = log_errflag;
+
+  // clear error & wakeup interrupts:
+  if (intstat & (CANINTF_MERRF | CANINTF_WAKIF | CANINTF_ERRIF))
+    {
+    m_status.error_flags |= 0x1000;
+    m_spibus->spi_cmd(m_spi, buf, 0, 4, CMD_BITMODIFY, REG_CANINTF,
+      intstat & (CANINTF_MERRF | CANINTF_WAKIF | CANINTF_ERRIF), 0);
+    }
+
+  if (log_status != CAN_LogNone)
+    {
+    LogStatus(log_status);
+    }
+
+  // Read the interrupt pin status and if it's still active (low), require another
+  // interrupt handling iteration. If it has gone high, this handled interrupt was
+  // the last pending source -- re-arm here too (see invariant comment above; this
+  // is the second, and only other, false-returning exit point of this function).
+  if (gpio_get_level((gpio_num_t)m_intpin))
+    {
+    if (m_mode != CAN_MODE_OFF && GetPowerMode() == On)
+      {
+      gpio_intr_enable((gpio_num_t)m_intpin);
+      }
+    return false;
+    }
+  return true;
+  }
+
+
+void mcp2515::TxCallback(CAN_frame_t* p_frame, bool success)
+  {
+  // Application callbacks & logging:
+  canbus::TxCallback(p_frame, success);
+
+  // TX buffer has become available; send next queued frame (if any):
+    {
+    OvmsMutexLock lock(&m_write_mutex);
+    CAN_frame_t frame;
+    while (xQueueReceive(m_txqueue, (void*)&frame, 0) == pdTRUE)
+      {
+      if (WriteFrame(&frame) == ESP_FAIL)
+        {
+        // This should not happen:
+        ESP_LOGE(TAG, "TxCallback: fatal error: TX buffer not available");
+        CAN_queue_msg_t msg;
+        msg.type = CAN_txfailedcallback;
+        msg.body.frame = frame;
+        msg.body.bus = this;
+        xQueueSend(MyCan.m_rxqueue, &msg, 0);
+        }
+      else
+        {
+        canbus::Write(&frame, 0);
+        break;
+        }
+      }
+    }
+  }
+
+
+void mcp2515::SetPowerMode(PowerMode powermode)
+  {
+  switch (powermode)
+    {
+    case On:
+        {
+        ESP_LOGI(TAG, "%s: SetPowerMode on", this->GetName());
+        if (!m_hw_present)
+          {
+          pcp::SetPowerMode(Off);
+          ESP_LOGW(TAG, "%s: keeping power mode off, MCP2515 unavailable", this->GetName());
+          break;
+          }
+        // Start() will call base SetPowerMode(On) if it actually turns on.
+        if (m_mode != CAN_MODE_OFF) Start(m_mode, m_speed);
+        }
+      break;
+    case Sleep:
+    case DeepSleep:
+    case Off:
+      {
+      // Make sure the event still gets called immediately
+      pcp::SetPowerMode(powermode);
+      ESP_LOGI(TAG, "%s: SetPowerMode off", this->GetName());
+      if (m_mode != CAN_MODE_OFF)
+        {
+        Stop();
+        }
+      else
+        {
+        gpio_intr_disable((gpio_num_t)m_intpin);
+        }
+      }
+      break;
+    default:
+      pcp::SetPowerMode(powermode);
+      break;
+    }
+  }
+
+void mcp2515::SetTransceiverMode(CAN_mode_t mode)
+  {
+  if (!m_hw_present)
+    {
+    return;
+    }
+
+  if ( mode == CAN_MODE_ACTIVE ) 
+    {
+      // BFPCTRL RXnBF PIN CONTROL AND STATUS - enable TX driver of SN65 - rd/wr mode
+      WriteRegAndVerify(REG_BFPCTRL, 0b00001100);
+    } 
+  else
+    {
+      // BFPCTRL RXnBF PIN CONTROL AND STATUS - disable TX driver of SN65 - listen only mode
+      WriteRegAndVerify(REG_BFPCTRL, 0b00111100);
+    }
+  }
+
+/**
+ * GetErrorFlagsDesc: decode error flags into human readable text
+ */
+bool mcp2515::GetErrorFlagsDesc(std::string &buffer, uint32_t error_flags)
+  {
+  // error_flags = (intstat << 24) | (errflag << 16) | intflag;
+  uint8_t intstat   = (error_flags >> 24) & 0xff;
+  uint8_t errflag   = (error_flags >> 16) & 0xff;
+  uint16_t intflag  = error_flags & 0xffff;
+
+  std::ostringstream ss;
+
+  if (intstat)
+    {
+    if (intstat & CANINTF_MERRF)    ss << " | " << "IR.7 RX/TX Message error";
+    if (intstat & CANINTF_WAKIF)    ss << " | " << "IR.6 Wakeup";
+    if (intstat & CANINTF_ERRIF)    ss << " | " << "IR.5 Error state change";
+    if (intstat & CANINTF_TX2IF)    ss << " | " << "IR.4 TX buffer 2 empty";
+    if (intstat & CANINTF_TX1IF)    ss << " | " << "IR.3 TX buffer 1 empty";
+    if (intstat & CANINTF_TX0IF)    ss << " | " << "IR.2 TX buffer 0 empty";
+    if (intstat & CANINTF_RX1IF)    ss << " | " << "IR.1 RX buffer 1 full";
+    if (intstat & CANINTF_RX0IF)    ss << " | " << "IR.0 RX buffer 0 full";
+    }
+  
+  if (errflag)
+    {
+    if (ss.tellp() > 0) ss << "\n";
+    if (errflag & EFLG_RX1OVR)      ss << " | " << "EF.7 Receive Buffer 1 Overflow";
+    if (errflag & EFLG_RX0OVR)      ss << " | " << "EF.6 Receive Buffer 0 Overflow";
+    if (errflag & EFLG_TXBO)        ss << " | " << "EF.5 Bus-Off Error (TEC == 255)";
+    if (errflag & EFLG_TXEP)        ss << " | " << "EF.4 Transmit Error-Passive (TEC >= 128)";
+    if (errflag & EFLG_RXEP)        ss << " | " << "EF.3 Receive Error-Passive (REC >= 128)";
+    if (errflag & EFLG_TXWAR)       ss << " | " << "EF.2 Transmit Error Warning (TEC >= 96)";
+    if (errflag & EFLG_RXWAR)       ss << " | " << "EF.1 Receive Error Warning (REC >= 96)";
+    if (errflag & EFLG_EWARN)       ss << " | " << "EF.0 Error Warning (TXWAR or RXWAR set)";
+    }
+  
+  if (intflag & 0xff00)
+    {
+    if (ss.tellp() > 0) ss << "\n";
+    if (intflag & 0x0100)           ss << " | " << "IF.1 TX success detected, buffer(s) cleared";
+    if (intflag & 0x0200)           ss << " | " << "IF.2 RXB1 overflow detected (frame lost)";
+    if (intflag & 0x0400)           ss << " | " << "IF.3 RXB0 overflow detected (frame in RXB1)";
+    if (intflag & 0x0800)           ss << " | " << "IF.4 RX buffer overflow flags cleared";
+    if (intflag & 0x1000)           ss << " | " << "IF.5 Error & wakeup interrupts cleared";
+    }
+  
+  buffer = ss.str();
+  return true;
+  }

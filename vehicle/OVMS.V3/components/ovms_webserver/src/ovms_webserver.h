@@ -1,0 +1,802 @@
+/*
+;    Project:       Open Vehicle Monitor System
+;    Date:          14th March 2017
+;
+;    Changes:
+;    1.0  Initial release
+;
+;    (C) 2011       Michael Stegen / Stegen Electronics
+;    (C) 2011-2017  Mark Webb-Johnson
+;    (C) 2011        Sonny Chen @ EPRO/DX
+;    (C) 2018       Michael Balzer
+;
+; Permission is hereby granted, free of charge, to any person obtaining a copy
+; of this software and associated documentation files (the "Software"), to deal
+; in the Software without restriction, including without limitation the rights
+; to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+; copies of the Software, and to permit persons to whom the Software is
+; furnished to do so, subject to the following conditions:
+;
+; The above copyright notice and this permission notice shall be included in
+; all copies or substantial portions of the Software.
+;
+; THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+; IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+; FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+; AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+; LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+; OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+; THE SOFTWARE.
+*/
+
+#ifndef __WEBSERVER_H__
+#define __WEBSERVER_H__
+
+#include <forward_list>
+#include <vector>
+#include <utility>
+#include <map>
+#include <set>
+#include <string>
+#include <ostream>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/timers.h"
+
+#include "ovms_events.h"
+#include "ovms_metrics.h"
+#include "ovms_config.h"
+#include "ovms_notify.h"
+#include "ovms_command.h"
+#include "ovms_shell.h"
+#include "ovms_netmanager.h"
+#include "ovms_utils.h"
+
+#include "log_buffers.h"
+#include "vehicle.h"
+
+// The setup wizard currently is tailored to be used with a WiFi enabled module:
+#ifdef CONFIG_OVMS_COMP_WIFI
+#define WEBSRV_HAVE_SETUPWIZARD 1
+#endif
+
+#define OVMS_GLOBAL_AUTH_FILE     "/store/.htpasswd"
+
+#define SESSION_COOKIE_NAME       "ovms_session"
+#define SESSION_TTL               3600
+#define SESSION_CHECK_INTERVAL    60
+#define NUM_SESSIONS              5
+
+#define XFER_CHUNK_SIZE           1024
+
+#define WEBSRV_USE_MG_BROADCAST   0  // Note: mg_broadcast() not working reliably yet, do not enable for production!
+
+// Asset URLs with versioning:
+#define URL_ASSETS_SCRIPT_JS      "/assets/script.js?v="       STR(MTIME_ASSETS_SCRIPT_JS)
+#define URL_ASSETS_CHARTS_JS      "/assets/charts.js?v="       STR(MTIME_ASSETS_CHARTS_JS)
+#define URL_ASSETS_TABLES_JS      "/assets/tables.js?v="       STR(MTIME_ASSETS_TABLES_JS)
+#define URL_ASSETS_STYLE_CSS      "/assets/style.css?v="       STR(MTIME_ASSETS_STYLE_CSS)
+#define URL_ASSETS_FAVICON_PNG    "/apple-touch-icon.png?v="   STR(MTIME_ASSETS_FAVICON_PNG)
+#define URL_ASSETS_ZONES_JSON     "/assets/zones.json?v="      STR(MTIME_ASSETS_ZONES_JSON)
+
+struct user_session {
+  uint64_t id;
+  time_t last_used;
+  //char* username;
+};
+
+
+typedef enum {
+  PageMenu_None,
+  PageMenu_Main,              // → main menu
+  PageMenu_Tools,             // → tools menu
+  PageMenu_Config,            // → config menu
+  PageMenu_Vehicle,           // → vehicle menu
+} PageMenu_t;
+
+inline PageMenu_t Code2PageMenu(std::string code) {
+  if (code == "Main")             return PageMenu_Main;
+  else if (code == "Tools")       return PageMenu_Tools;
+  else if (code == "Config")      return PageMenu_Config;
+  else if (code == "Vehicle")     return PageMenu_Vehicle;
+  else                            return PageMenu_None;
+}
+
+typedef enum {
+  PageAuth_None,              // public
+  PageAuth_Cookie,            // use auth cookie
+  PageAuth_File,              // use htaccess file(s) (digest auth)
+} PageAuth_t;
+
+inline PageAuth_t Code2PageAuth(std::string code) {
+  if (code == "Cookie")           return PageAuth_Cookie;
+  else if (code == "File")        return PageAuth_File;
+  else                            return PageAuth_None;
+}
+
+typedef enum {
+  PageResult_OK,              // NOP
+  PageResult_STOP,            // stop page callbacks & handler execution
+} PageResult_t;
+
+struct PageEntry;
+typedef struct PageEntry PageEntry_t;
+struct PageContext;
+typedef struct PageContext PageContext_t;
+typedef void (*PageHandler_t)(PageEntry_t& p, PageContext_t& c);
+typedef PageResult_t (*PageCallback_t)(PageEntry_t& p, PageContext_t& c, const std::string& hook);
+
+// Page hook point definition (to be used in a handler with p = PageEntry&, c = PageContext&):
+#define PAGE_HOOK(code) { if (p.callback(c, code) == PageResult_STOP) return; }
+
+
+/**
+ * PageContext: execution context of a URI/page handler call providing
+ *  access to the HTTP context and utilities to generate HTML output.
+ */
+
+struct PageContext : public ExternalRamAllocated
+{
+  mg_connection *nc;
+  http_message *hm;
+  user_session *session;
+  std::string method;
+  std::string uri;
+
+  // utils:
+  std::string getvar(const std::string& name, size_t maxlen=200);
+  bool getvar(const std::string& name, extram::string& dst);
+  static std::string encode_html(const char* text);
+  static std::string encode_html(const std::string text);
+  static extram::string encode_html(const extram::string& text);
+  static std::string make_id(const char* text);
+  static std::string make_id(const std::string text);
+
+  // output:
+  void error(int code, const char* text);
+  void head(int code, const char* headers=NULL);
+  void print(const std::string text);
+  void print(const extram::string text);
+  void print(const char* text);
+  void printf(const char *fmt, ...) __attribute__ ((format (printf, 2, 3)));
+  void done();
+  void panel_start(const char* type, const char* title);
+  void panel_end(const char* footer="");
+  void form_start(std::string action, const char* target=NULL);
+  void form_end();
+  void fieldset_start(const char* title, const char* css_class=NULL);
+  void fieldset_end();
+  void hr();
+  void input(const char* type, const char* label, const char* name, const char* value,
+    const char* placeholder=NULL, const char* helptext=NULL, const char* moreattrs=NULL,
+    const char* unit=NULL);
+  void input_text(const char* label, const char* name, const char* value,
+    const char* placeholder=NULL, const char* helptext=NULL, const char* moreattrs=NULL);
+  void input_password(const char* label, const char* name, const char* value,
+    const char* placeholder=NULL, const char* helptext=NULL, const char* moreattrs=NULL);
+  void input_select_start(const char* label, const char* name);
+  void input_select_option(const char* label, const char* value, bool selected);
+  void input_select_end(const char* helptext=NULL);
+  void input_radio_start(const char* label, const char* name);
+  void input_radio_option(const char* name, const char* label, const char* value, bool selected);
+  void input_radio_end(const char* helptext=NULL);
+  void input_radiobtn_start(const char* label, const char* name);
+  void input_radiobtn_option(const char* name, const char* label, const char* value, bool selected);
+  void input_radiobtn_end(const char* helptext=NULL);
+  void input_checkbox(const char* label, const char* name, bool value, const char* helptext=NULL);
+  void input_slider(const char* label, const char* name, int size, const char* unit,
+    int enabled, double value, double defval, double min, double max, double step=1,
+    const char* helptext=NULL);
+  void input_button(const char* btnclass, const char* label, const char* name=NULL, const char* value=NULL);
+  void input_info(const char* label, const char* text);
+  void alert(const char* type, const char* text);
+
+  PageResult_t callback(PageEntry_t& p, const std::string& hook);
+};
+
+
+/**
+ * PageEntry: HTTP URI page handler entry for OvmsWebServer.
+ *
+ * Created by OvmsWebServer::RegisterPage(). The registered handler will be called
+ *  with both PageEntry and PageContext, so one handler can serve multiple
+ *  URIs or patterns.
+ */
+
+struct PageCallbackEntry
+{
+  std::string       caller;
+  PageCallback_t    handler;
+
+  PageCallbackEntry(std::string _caller, PageCallback_t _handler)
+  {
+    caller = _caller;
+    handler = _handler;
+  }
+};
+
+typedef std::forward_list<PageCallbackEntry> PageCallbackMap_t;
+
+struct PageEntry
+{
+  std::string uri;
+  std::string label;
+  PageHandler_t handler;
+  PageMenu_t menu;
+  PageAuth_t auth;
+  PageCallbackMap_t callbacklist;
+
+  PageEntry(std::string _uri, std::string _label, PageHandler_t _handler, PageMenu_t _menu=PageMenu_None, PageAuth_t _auth=PageAuth_None)
+  {
+    uri = _uri;
+    label = _label;
+    handler = _handler;
+    menu = _menu;
+    auth = _auth;
+  }
+
+  void Serve(PageContext_t& c);
+
+  void RegisterCallback(std::string caller, PageCallback_t handler, int priority=0);
+  void DeregisterCallback(std::string caller);
+  PageResult_t callback(PageContext_t& c, const std::string& hook);
+};
+
+typedef std::forward_list<PageEntry> PageMap_t;
+
+
+/**
+ * Plugin Cache
+ */
+
+struct PagePluginContent
+{
+  bool              m_pluginstore;
+  std::string       m_path;
+  extram::string    m_content;
+
+  PagePluginContent(std::string path, bool pluginstore=false) {
+    m_path = path;
+    m_pluginstore = pluginstore;
+  }
+
+  extram::string& GetContent() {
+    if (m_content.empty())
+      LoadContent();
+    return m_content;
+  }
+
+  void LoadContent();
+};
+
+typedef std::map<std::string, PagePluginContent> PagePluginMap;
+typedef std::multimap<std::string, PagePluginContent> PagePluginMultiMap;
+
+
+/**
+ * MgHandler is the base mongoose connection handler interface class
+ *  to implement stateful connections.
+ *
+ * An MgHandler instance automatically attaches itself to (and detaches from)
+ *  the mg_connection via the user_data field.
+ * The HandleEvent() method will be called prior to the framework handler.
+ */
+class MgHandler : public ExternalRamAllocated
+{
+  public:
+    MgHandler(mg_connection* nc)
+    {
+      m_nc = nc;
+      if (m_nc)
+        m_nc->user_data = this;
+    }
+    virtual ~MgHandler()
+    {
+      if (m_nc)
+        m_nc->user_data = NULL;
+    }
+
+  public:
+    virtual int HandleEvent(int ev, void* p) = 0;
+    void RequestPoll();
+    static void HandlePoll(mg_connection* nc, int ev, void* p);
+
+  public:
+    mg_connection*            m_nc = NULL;
+};
+
+
+/**
+ * HttpDataSender transmits a memory area (ROM/RAM) in HTTP chunks of XFER_CHUNK_SIZE size.
+ */
+
+typedef std::pair<const uint8_t*, size_t> MemRegion;
+typedef std::vector<MemRegion> MemRegionList;
+
+class HttpDataSender : public MgHandler
+{
+  public:
+    HttpDataSender(mg_connection* nc, MemRegionList xferlist, bool keepalive=true);
+    HttpDataSender(mg_connection* nc, const uint8_t* data, size_t size, bool keepalive=true);
+    ~HttpDataSender();
+
+  public:
+    int HandleEvent(int ev, void* p);
+
+  public:
+    MemRegionList             m_xferlist;             // list of memory regions to send
+    ssize_t                   m_xfer = 0;             // current region in process
+    const uint8_t*            m_data = NULL;          // pointer to data
+    size_t                    m_size = 0;             // size of data to send
+    size_t                    m_sent = 0;             // size sent up to now
+    bool                      m_keepalive = false;    // false = close connection when done
+};
+
+
+/**
+ * HttpStringSenderT transmits a string in HTTP chunks of XFER_CHUNK_SIZE size.
+ * Note: the string is deleted after transmission.
+ *
+ * Two instantiations are provided: HttpStringSender for a std::string, and
+ * HttpExtRamStringSender for an extram::string. Prefer the latter for file-sized
+ * bodies: the sender takes ownership of the buffer the body was loaded into and
+ * emits it in place, so serving a large body needs no second full-size allocation.
+ */
+template <class StringType>
+class HttpStringSenderT : public MgHandler
+{
+  public:
+    HttpStringSenderT(mg_connection* nc, StringType* msg, bool keepalive=true)
+      : MgHandler(nc)
+    {
+      m_msg = msg;
+      m_sent = 0;
+      m_keepalive = keepalive;
+      ESP_EARLY_LOGV("webserver", "HttpStringSender[%p]: init msg=%p, %d bytes", nc, m_msg, m_msg->size());
+    }
+    ~HttpStringSenderT()
+    {
+      if (m_sent < m_msg->size()) {
+        ESP_EARLY_LOGV("webserver", "HttpStringSender[%p]: abort msg=%p, %d bytes sent", m_nc, m_msg, m_sent);
+      }
+      delete m_msg;
+    }
+
+  public:
+    int HandleEvent(int ev, void* p)
+    {
+      switch (ev)
+      {
+        case MG_EV_SEND:          // last transmission has finished
+        {
+          if (m_sent < m_msg->size()) {
+            // send next chunk:
+            size_t remain = m_msg->size() - m_sent;
+            size_t len = (remain < (size_t) XFER_CHUNK_SIZE) ? remain : (size_t) XFER_CHUNK_SIZE;
+            mg_send_http_chunk(m_nc, (const char*) m_msg->data() + m_sent, len);
+            m_sent += len;
+            ESP_EARLY_LOGV("webserver", "HttpStringSender[%p] msg=%p sent %d/%d", m_nc, m_msg, m_sent, m_msg->size());
+          }
+          else {
+            // done:
+            if (!m_keepalive)
+              m_nc->flags |= MG_F_SEND_AND_CLOSE;
+            mg_send_http_chunk(m_nc, "", 0);
+            ESP_EARLY_LOGV("webserver", "HttpStringSender[%p]: done msg=%p, %d bytes sent", m_nc, m_msg, m_sent);
+            delete this;
+          }
+        }
+        break;
+
+        default:
+          break;
+      }
+
+      return ev;
+    }
+
+  public:
+    StringType*               m_msg = NULL;           // pointer to data
+    size_t                    m_sent = 0;             // size sent up to now
+    bool                      m_keepalive = false;    // false = close connection when done
+};
+
+typedef HttpStringSenderT<std::string>      HttpStringSender;
+typedef HttpStringSenderT<extram::string>   HttpExtRamStringSender;
+
+
+/**
+ * WebSocketHandler transmits JSON data in chunks to the WebSocket client
+ *  and coordinates transmits initiated from other contexts (i.e. events).
+ *
+ * On creation it will do a full update of all metrics.
+ * Later on, it receives TX jobs through the queue.
+ */
+
+enum WebSocketTxJobType
+{
+  WSTX_None = 0,
+  WSTX_Event,                 // payload: event
+  WSTX_MetricsAll,            // payload: -
+  WSTX_MetricsUpdate,         // payload: -
+  WSTX_Config,                // payload: config (todo)
+  WSTX_Notify,                // payload: notification
+  WSTX_LogBuffers,            // payload: logbuffers
+  WSTX_UnitMetricUpdate,      // payload: -
+  WSTX_UnitPrefsUpdate,       // payload: -
+};
+
+struct WebSocketTxJob
+{
+  WebSocketTxJobType          type;
+  union
+  {
+    char*                     event;
+    OvmsConfigParam*          config;
+    OvmsNotifyEntry*          notification;
+    LogBuffers*               logbuffers;
+  };
+
+  void clear(size_t client);
+};
+
+struct WebSocketTxTodo
+{
+  int                     client;
+  WebSocketTxJob          job;
+};
+
+class WebSocketHandler : public MgHandler, public OvmsWriter
+{
+  public:
+    WebSocketHandler(mg_connection* nc, size_t slot, size_t modifier, size_t reader, size_t txqueuesize);
+    ~WebSocketHandler();
+
+  public:
+    bool Lock(TickType_t xTicksToWait);
+    void Unlock();
+    bool AddTxJob(WebSocketTxJob job, bool init_tx=true);
+    void ClearTxJob(WebSocketTxJob &job);
+    bool GetNextTxJob();
+    void InitTx();
+    void ContinueTx();
+    void ProcessTxJob();
+    int HandleEvent(int ev, void* p);
+    void HandleIncomingMsg(std::string msg);
+    void LogStatus();
+
+  public:
+    void Subscribe(std::string topic);
+    void Unsubscribe(std::string topic);
+    bool IsSubscribedTo(std::string topic);
+
+    void SubscriptionChanged();
+    void UnitsCheckSubscribe();
+    void UnitsCheckVehicleSubscribe();
+
+  // OvmsWriter:
+  public:
+    void Log(LogBuffers* message);
+
+  public:
+    size_t                    m_slot = 0;
+    size_t                    m_modifier = 0;         // "our" metrics modifier
+    size_t                    m_reader = 0;           // "our" notification reader id
+    QueueHandle_t             m_jobqueue = NULL;
+    uint32_t                  m_jobqueue_overflow_dropcnt = 0;
+    uint32_t                  m_jobqueue_overflow_logged = 0;
+    WebSocketTxJob            m_job = {};
+    int                       m_sent = 0;
+    int                       m_ack = 0;
+    int                       m_last = 0;             // last entry sent up
+    std::set<std::string>     m_subscriptions;
+    bool                      m_units_subscribed;
+    bool                      m_units_prefs_subscribed;
+};
+
+struct WebSocketSlot
+{
+  WebSocketHandler*   handler;
+  size_t              modifier;
+  size_t              reader;
+};
+
+typedef std::vector<WebSocketSlot> WebSocketSlots;
+
+
+/**
+ * HttpCommandStream: execute command, stream output to HTTP connection
+ */
+
+class HttpCommandStream : public OvmsShell, public MgHandler
+{
+  public:
+    HttpCommandStream(mg_connection* nc, extram::string command, bool javascript=false, int verbosity=COMMAND_RESULT_VERBOSE);
+    ~HttpCommandStream();
+
+  public:
+    void ProcessQueue();
+    int HandleEvent(int ev, void* p);
+    static void CommandTask(void* object);
+
+  public:
+    extram::string            m_command;
+    bool                      m_javascript = false;
+    TaskHandle_t              m_cmdtask = NULL;
+    QueueHandle_t             m_writequeue = NULL;
+    bool                      m_done = false;
+    size_t                    m_sent = 0;
+    int                       m_ack = 0;
+
+  public:
+    void Initialize(bool print);
+    virtual bool IsInteractive() { return false; }
+    int puts(const char* s);
+    int printf(const char* fmt, ...) __attribute__ ((format (printf, 2, 3)));
+    ssize_t write(const void *buf, size_t nbyte);
+    void Log(LogBuffers* message);
+};
+
+
+#ifdef CONFIG_OVMS_COMP_OTA
+/**
+ * HttpFirmwareUpload: receive a streamed multipart firmware upload and flash it
+ *  directly into the inactive OTA partition (no SD card needed).
+ *
+ * Created by EventHandler() on an authorized MG_EV_HTTP_MULTIPART_REQUEST for the
+ *  upload endpoint; it then consumes the MG_EV_HTTP_PART_* events, feeding the
+ *  image to MyOTA.StreamFlash*(). The firmware part is the first part carrying a
+ *  filename; other form fields are ignored.
+ */
+class HttpFirmwareUpload : public MgHandler
+{
+  public:
+    HttpFirmwareUpload(mg_connection* nc, size_t expected_size = 0);
+    ~HttpFirmwareUpload();
+
+  public:
+    int HandleEvent(int ev, void* p);
+
+  protected:
+    void Respond(int code, const std::string& text);
+
+  protected:
+    bool                      m_flashing = false;     // a StreamFlash session is open
+    bool                      m_responded = false;    // HTTP response already sent
+    bool                      m_ok = false;           // image received & flashed
+    size_t                    m_expected = 0;         // image size from ?size= (0 = unknown)
+    size_t                    m_size = 0;             // bytes received for the image
+    std::string               m_target;               // target partition label (on success)
+};
+#endif // CONFIG_OVMS_COMP_OTA
+
+
+
+/**
+ * OvmsWebServer: main web framework (static instance: MyWebServer)
+ *
+ * Register custom page handlers through the RegisterPage() API.
+ */
+
+class OvmsWebServer : public ExternalRamAllocated, MongooseClient
+{
+  public:
+    OvmsWebServer();
+    ~OvmsWebServer();
+
+  public:
+    static void EventHandler(mg_connection *nc, int ev, void *p);
+    void NetManInit(std::string event, void* data);
+    void NetManStop(std::string event, void* data);
+    void ConfigChanged(std::string event, void* data);
+    void UpdateGlobalAuthFile();
+    static const std::string MakeDigestAuth(const char* realm, const char* username, const char* password);
+    static const std::string ExecuteCommand(const std::string command, int verbosity=COMMAND_RESULT_NORMAL);
+    void EventListener(std::string event, void* data);
+    static void UpdateTicker(TimerHandle_t timer);
+    static bool NotificationFilter(int client, OvmsNotifyType* type, const char* subtype);
+    static bool IncomingNotification(int client, OvmsNotifyType* type, OvmsNotifyEntry* entry);
+
+  public:
+    void RegisterPage(std::string uri, std::string label, PageHandler_t handler,
+      PageMenu_t menu=PageMenu_None, PageAuth_t auth=PageAuth_None, int priority=0);
+    void DeregisterPage(std::string uri);
+    PageEntry* FindPage(std::string uri);
+    bool RegisterCallback(std::string caller, std::string uri, PageCallback_t handler, int priority=0);
+    void DeregisterCallbacks(std::string caller);
+    void RegisterPlugins();
+    void DeregisterPlugins();
+    void ReloadPlugin(std::string path);
+    static void PluginHandler(PageEntry_t& p, PageContext_t& c);
+    static PageResult_t PluginCallback(PageEntry_t& p, PageContext_t& c, const std::string& hook);
+
+  public:
+    user_session* CreateSession(const http_message *hm);
+    void DestroySession(user_session *s);
+    user_session* GetSession(http_message *hm);
+    void CheckSessions(void);
+    static bool CheckLogin(std::string username, std::string password);
+#ifdef CONFIG_OVMS_COMP_OTA
+    // Authorize a multipart request (e.g. firmware upload). Multipart requests
+    // bypass PageEntry::Serve, so the cookie/apikey auth is re-checked here.
+    bool AuthorizeMultipart(http_message *hm);
+#endif
+
+  public:
+    WebSocketHandler* CreateWebSocketHandler(mg_connection* nc);
+    void DestroyWebSocketHandler(WebSocketHandler* handler);
+    bool AddToBacklog(int client, WebSocketTxJob job);
+
+  public:
+    static std::string CreateMenu(PageContext_t& c);
+    static void OutputHome(PageEntry_t& p, PageContext_t& c);
+    static void HandleRoot(PageEntry_t& p, PageContext_t& c);
+    static void HandleAsset(PageEntry_t& p, PageContext_t& c);
+    static void HandleMenu(PageEntry_t& p, PageContext_t& c);
+    static void HandleHome(PageEntry_t& p, PageContext_t& c);
+    static void HandleLogin(PageEntry_t& p, PageContext_t& c);
+    static void HandleLogout(PageEntry_t& p, PageContext_t& c);
+    static void OutputReboot(PageEntry_t& p, PageContext_t& c);
+    static void OutputReconnect(PageEntry_t& p, PageContext_t& c, const char* info=NULL, const char* cmd=NULL);
+
+  public:
+    static void HandleStatus(PageEntry_t& p, PageContext_t& c);
+    static void HandleCommand(PageEntry_t& p, PageContext_t& c);
+    static void HandleFile(PageEntry_t& p, PageContext_t& c);
+    static void HandleShell(PageEntry_t& p, PageContext_t& c);
+    static void HandleDashboard(PageEntry_t& p, PageContext_t& c);
+    static void HandleMetrics(PageEntry_t& p, PageContext_t& c);
+    static void HandleBmsCellMonitor(PageEntry_t& p, PageContext_t& c);
+    static void HandleCfgBrakelight(PageEntry_t& p, PageContext_t& c);
+    static void HandleEditor(PageEntry_t& p, PageContext_t& c);
+    static void HandleCfgPassword(PageEntry_t& p, PageContext_t& c);
+    static void HandleCfgVehicle(PageEntry_t& p, PageContext_t& c);    
+    static void HandleCfgPreconditionSchedule(PageEntry_t& p, PageContext_t& c);
+    static void HandleCfgModem(PageEntry_t& p, PageContext_t& c);
+    static void HandleCfgServerV2(PageEntry_t& p, PageContext_t& c);
+    static void HandleCfgServerV3(PageEntry_t& p, PageContext_t& c);
+    static void HandleCfgNotifications(PageEntry_t& p, PageContext_t& c);
+    static void HandleCfgWebServer(PageEntry_t& p, PageContext_t& c);
+#ifdef CONFIG_OVMS_COMP_PUSHOVER
+    static void HandleCfgPushover(PageEntry_t& p, PageContext_t& c);
+#endif
+    static void HandleCfgWifi(PageEntry_t& p, PageContext_t& c);
+    static void OutputWifiTable(PageEntry_t& p, PageContext_t& c, const std::string prefix, const std::string paramname,
+      const std::string autostart_ssid);
+    static void UpdateWifiTable(PageEntry_t& p, PageContext_t& c, const std::string prefix, const std::string paramname,
+      std::string& warn, std::string& error, int pass_minlen);
+    static void HandleCfgAutoInit(PageEntry_t& p, PageContext_t& c);
+    static void HandleCfgFirmware(PageEntry_t& p, PageContext_t& c);
+    static void HandleCfgPartitioning(PageEntry_t& p, PageContext_t& c);
+    static void HandleCfgLogging(PageEntry_t& p, PageContext_t& c);
+    static void HandleCfgLocations(PageEntry_t& p, PageContext_t& c);
+    static void HandleCfgBackup(PageEntry_t& p, PageContext_t& c);
+    static void HandleCfgPlugins(PageEntry_t& p, PageContext_t& c);
+
+#ifdef WEBSRV_HAVE_SETUPWIZARD
+  public:
+    void CfgInitStartup();
+    static void HandleCfgInit(PageEntry_t& p, PageContext_t& c);
+    static std::string CfgInitSetStep(std::string step, int timeout=0);
+    void CfgInitTicker();
+    std::string CfgInit1(PageEntry_t& p, PageContext_t& c, std::string step);
+    std::string CfgInit2(PageEntry_t& p, PageContext_t& c, std::string step);
+    std::string CfgInit3(PageEntry_t& p, PageContext_t& c, std::string step);
+    std::string CfgInit4(PageEntry_t& p, PageContext_t& c, std::string step);
+    std::string CfgInit5(PageEntry_t& p, PageContext_t& c, std::string step);
+#endif // WEBSRV_HAVE_SETUPWIZARD
+
+
+  public:
+    bool                      m_running;
+    bool                      m_configured;
+
+#if MG_ENABLE_FILESYSTEM
+    bool                      m_file_enable;
+    mg_serve_http_opts        m_file_opts;
+#endif //MG_ENABLE_FILESYSTEM
+
+    PageMap_t                 m_pagemap;
+    PagePluginMap             m_plugin_pages;
+    PagePluginMultiMap        m_plugin_parts;
+
+    user_session              m_sessions[NUM_SESSIONS];
+
+    size_t                    m_client_cnt;                 // number of active WebSocket clients
+    SemaphoreHandle_t         m_client_mutex;
+    WebSocketSlots            m_client_slots;
+    size_t                    m_client_txqueuesize;         // size of WebSocketTxJob queue (config http.server ws.txqueuesize)
+    QueueHandle_t             m_client_backlog;
+    TimerHandle_t             m_update_ticker;
+
+    int                       m_init_timeout;
+    int                       m_shutdown_countdown;
+    uint32_t                  m_tick;
+};
+
+extern OvmsWebServer MyWebServer;
+
+/** Dashboard Gauge generator.
+ * Handles unit conversions.
+ */
+struct dash_gauge_t {
+protected:
+  struct dash_plot_band_t {
+    std::string colour;
+    float min_value, max_value;
+  };
+  std::string title_prefix;
+  metric_unit_t user_unit, base_unit;
+  float min_value, max_value, tick_value;
+  bool has_tick;
+  std::vector<dash_plot_band_t> bands;
+  void DoAddBand( const std::string &colour, float minValue, float maxValue, bool round, float roundValue);
+public:
+
+  /**
+   * @param titlePrefix The title/caption prefix (to the unit)
+   * @param defUnit  The unit used as a default for these metrics.
+   * @param group    (Optional) The group of units it belong to.
+   */
+  dash_gauge_t(const char *titlePrefix, metric_unit_t defUnit, metric_group_t group = GrpNone);
+  /**
+   * Convert a unit to the user unit.
+   */
+  float UntConvert( float inValue ) const;
+  /**
+   * Convert a unit to the user unit with rounding to the nearest value.
+   */
+  float UntConvert( float inValue, float roundValue ) const;
+  /**
+   * Set the minimum and maximum values for the gauge (in original units).
+   */
+  void SetMinMax( float minValue, float maxValue);
+  /**
+   * Set the minimum and maximum values for the gauge (in original units) including
+   * rounding to the nearest value.
+   */
+  void SetMinMax( float minValue, float maxValue, float roundValue);
+  /**
+   * Set the tickmark intervals (in original units).
+   */
+  void SetTick( float tickValue);
+  /**
+   * Set the tickmark intervals (in original units) with rounding to nearest.
+   */
+  void SetTick( float tickValue, float roundValue);
+  /** Zero the minimum.  Used when 0 cannot be originally used as a minimum.
+   */
+  inline void ZeroMin() { if (max_value > 0) min_value = 0; }
+
+  /** Add a colour band to the gauge.
+   */
+  inline void AddBand( const std::string &colour, float minValue, float maxValue)
+  {
+    DoAddBand(colour, minValue, maxValue, false, 0);
+  }
+  /** Add a colour band to the gauge with rounding to the nearest value.
+   */
+  inline void AddBand( const std::string &colour, float minValue, float maxValue, float roundValue)
+  {
+    DoAddBand(colour, minValue, maxValue, true, roundValue);
+  }
+
+  /** Output this element to a stream.
+   */
+  std::ostream &Output(std::ostream &ostream) const;
+};
+inline std::ostream &operator<<(std::ostream &out, const dash_gauge_t& gauge)
+{
+  return gauge.Output(out);
+}
+
+
+/**
+ * DashboardConfig:
+ */
+struct DashboardConfig
+{
+  std::string gaugeset1;
+};
+
+#endif //#ifndef __WEBSERVER_H__
