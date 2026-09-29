@@ -136,36 +136,17 @@ void OvmsVehicleSmartEQ::Ticker10(uint32_t ticker)
 
   if(m_enable_LED_state) 
     OnlineState();
-  
-  if(canCANbusActive() && (!m_can_active || !m_can_last_acc_state))
+  if((!m_can_active && m_enable_write && IsAwakeEQ()) ||
+     (!m_can_active && m_enable_write_caron && IsOnEQ()))
     {
-    // start polling when conditions are met and the car is not already in polling mode
     smartCoolDownPolling();
-    smartOBDpolling();
-    }
-  else if(!canCANbusActive() && (m_can_active || m_can_last_acc_state)) 
-    {    
-    // stop polling when conditions are not met and the car is in polling mode
-    smartCoolDownPolling();
-    smartOBDpolling(false);
-    }
-  // check for CAN bus error state and stop CAN access if error state is detected
-  if (m_can1 &&
-      m_can1->GetErrorState() >= CAN_errorstate_passive)
-    {
-    ESP_LOGE(TAG, "CAN1 error state %s, stopping CAN access",
-            m_can1->GetErrorStateName());
-
-    smartCoolDownPolling();
-    smartOBDpolling(false);
+    smartOBDpolling(true);
     }
   // if charging is in progress, then modify polling to get the DCDC/Charging data (reboot prevention)
   if (IsChargingEQ() && !m_poll_on_charge)
     {
     smartChargeStart();
     }
-  if (m_gps_log_enable && IsOnEQ() && !StdMetrics.ms_v_pos_latitude->IsStale() && StdMetrics.ms_v_pos_gpslock->AsBool(false))
-    SendGPSLog();
   } // Ticker 10
 
 void OvmsVehicleSmartEQ::Ticker60(uint32_t ticker) 
@@ -182,8 +163,8 @@ void OvmsVehicleSmartEQ::Ticker60(uint32_t ticker)
     StdMetrics.ms_v_charge_12v_voltage->SetValue(0.0f); // reset 12V voltage when not charging to prevent desync
 
   #if defined(CONFIG_OVMS_COMP_WIFI) || defined(CONFIG_OVMS_COMP_CELLULAR)
-    if((MyOvmsServerV2 || MyOvmsServerV3) && m_reboot_time > 0)
-      HandleServerCon();
+    if(m_reboot_time > 0) 
+      Handlev2Server();
   #endif
 
   // DDT4ALL session timeout on 5 minutes

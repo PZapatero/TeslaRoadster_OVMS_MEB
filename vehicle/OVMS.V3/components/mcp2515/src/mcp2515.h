@@ -90,13 +90,11 @@ class mcp2515 : public canbus
 
   protected:
     esp_err_t WriteFrame(const CAN_frame_t* p_frame);
-    esp_err_t EnableRXFilter(bool enable);
 
   public:
     void SetPowerMode(PowerMode powermode) override;
     bool GetErrorFlagsDesc(std::string &buffer, uint32_t error_flags) override;
     void SetTransceiverMode(CAN_mode_t mode);
-    bool CheckRxStalled() override;
 
   public:
     static void shell_setaccfilter(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int argc, const char* const* argv);
@@ -104,13 +102,12 @@ class mcp2515 : public canbus
   public:
     spi* m_spibus;
     spi_device_handle_t m_spi;
-    int m_intpin;  // public: read by the file-scope ISR (MCP2515_isr) to mask/re-arm its own INT line
 
   protected:
     spi_device_interface_config_t m_devcfg;
     int m_clockspeed;
     int m_cspin;
-    bool m_hw_present = false;
+    int m_intpin;
     uint8_t m_last_errflag = 0;
     uint8_t m_canctrl_mode;
     OvmsMutex m_write_mutex;

@@ -41,7 +41,7 @@
 class ConsoleSSH;
 struct mg_connection;
 
-class OvmsSSH : public MongooseClient, public ConsoleReaper
+class OvmsSSH : public MongooseClient
   {
   public:
     OvmsSSH();
@@ -80,7 +80,6 @@ class ConsoleSSH : public OvmsConsole, public MongooseClient
     ssize_t write(const void *buf, size_t nbyte);
     int RecvCallback(char* buf, uint32_t size);
     bool IsDraining() { return m_drain > 0; }
-    mg_connection* GetConnection() { return m_connection; }
 
   private:
     typedef struct {DIR* dir; size_t size;} Level;

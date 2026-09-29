@@ -1,10 +1,9 @@
 /**
  * Module plugin:
  *  Tasmota Smart Plug control -- see https://tasmota.github.io/
- *  Version 2.2 by Michael Balzer <dexter@dexters-web.de>
+ *  Version 2.1 by Michael Balzer <dexter@dexters-web.de>
  * 
  * History:
- *  - v2.2: fix HTTP API username parameter
  *  - v2.1: energy data dialog in status plugin, suppress repeated on/off events, add getdata command
  *  - v2.0: power/energy monitoring
  *  - v1.0: initial release
@@ -82,7 +81,7 @@ function processResult(tag) {
 // Create HTTP API URL:
 function makeCommandURL(command) {
   var url = "http://" + cfg.ip
-    + "/cm?user=" + encodeURIComponent(cfg.user)
+    + "/cm?username=" + encodeURIComponent(cfg.user)
     + "&password=" + encodeURIComponent(cfg.pass)
     + "&cmnd=" + encodeURIComponent(command);
   return url;

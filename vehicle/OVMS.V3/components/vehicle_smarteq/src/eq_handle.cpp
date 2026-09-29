@@ -39,7 +39,7 @@ void OvmsVehicleSmartEQ::HandlePollState() {
 
   static const char* state_names[] = {"Off", "Awake", "Running", "Charging"};
   static const char* state_disabled = "Pollstate Off (write disabled)";
-  if (!canCANbusActive()) 
+  if (!IsCANwrite()) 
     {
     if (m_poll_state != POLLSTATE_OFF) 
       {
@@ -102,9 +102,10 @@ void OvmsVehicleSmartEQ::HandleOBDpolling() {
   PollSetPidList(m_can1, NULL);  // Stop active polls during list rebuild (sufficient – no smartCoolDownPolling needed here)
   PollSetThrottling(3);
   PollSetResponseSeparationTime(20);
+
   // modify Poller..
   m_poll_vector.clear();
-  if (!m_can_active || !canCANbusActive())
+  if (!m_can_active)
     {
     ESP_LOGD(TAG, "HandleOBDpolling(): OBD polling disabled (CAN bus not active)");
     return;
@@ -166,17 +167,14 @@ void OvmsVehicleSmartEQ::HandleOBDpolling() {
  * Called once per second from Ticker1
  */
 void OvmsVehicleSmartEQ::HandleEnergy() {
-  if(IsChargingEQ()) 
-    return; // Skip energy handling while charging (handled in HandleCharging)
-
-  float power = StdMetrics.ms_v_bat_power->AsFloat(0.0f); // kW - charge(-)/discharge(+) HV battery power
+  float power = StdMetrics.ms_v_bat_power->AsFloat(0.0f); // in kW
   ESP_LOGD(TAG, "HandleEnergy(): power=%.2f kW", power);
   if (power != 0.0f)
     {
     // Update energy used and recovered   
     float energy = fabs(power / 3600.0f);       // 1 second worth of energy in kwh's
     float current_Ah = fabs(StdMetrics.ms_v_bat_current->AsFloat(0.0f) / 3600.0f);   // 1 second worth of current in Ah
-    if (power > 0.0f)
+    if (power < 0.0f)
       {
       float energy_used = StdMetrics.ms_v_bat_energy_used->AsFloat(0.0f) + energy;
       float energy_used_total = StdMetrics.ms_v_bat_energy_used_total->AsFloat(0.0f) + energy;
@@ -187,7 +185,7 @@ void OvmsVehicleSmartEQ::HandleEnergy() {
       StdMetrics.ms_v_bat_coulomb_used->SetValue(coulomb_used);
       StdMetrics.ms_v_bat_coulomb_used_total->SetValue(coulomb_used_total);
       }
-    else if (power < 0.0f)
+    else if (power > 0.0f)
       {
       float energy_recd = StdMetrics.ms_v_bat_energy_recd->AsFloat(0.0f) + energy;
       float energy_recd_total = StdMetrics.ms_v_bat_energy_recd_total->AsFloat(0.0f) + energy;
@@ -222,22 +220,15 @@ void OvmsVehicleSmartEQ::HandleTripcounter(){
     }
 }
 
-void OvmsVehicleSmartEQ::HandleServerCon(){
-  // Handle Server connection
-  bool modem_off = (MyPeripherals && MyPeripherals->m_cellular_modem &&
-                    MyPeripherals->m_cellular_modem->GetPowerMode() == Off);
-
-  if (modem_off || StdMetrics.ms_s_v2_connected->AsBool() || StdMetrics.ms_s_v3_connected->AsBool()) 
-    {
-    m_reboot_ticker = m_reboot_time; // reset reboot ticker when server connection is detected or cellular is off by power management/user
-    ESP_LOGD(TAG, "Server connection detected, reboot ticker reset to %d", m_reboot_time);
-    }
-  else if (m_reboot_ticker > 0 && --m_reboot_ticker == 0) 
-    {
+void OvmsVehicleSmartEQ::Handlev2Server(){
+  // Handle v2Server connection
+  if (StdMetrics.ms_s_v2_connected->AsBool()) {
+    m_reboot_ticker = m_reboot_time; // set reboot ticker
+  }
+  else if (m_reboot_ticker > 0 && --m_reboot_ticker == 0) {
     MyNetManager.RestartNetwork();
     m_reboot_ticker = m_reboot_time;
-    ESP_LOGD(TAG, "Server connection lost for %d seconds, restarting network", m_reboot_time);
-    }
+  }
 }
 
 /**

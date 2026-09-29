@@ -39,16 +39,12 @@ OvmsVehicle::vehicle_command_t  OvmsVehicleSmartEQ::CommandCanVector(uint32_t tx
   if(!IsCANwrite())
     {
     ESP_LOGE(TAG, "CommandCanVector failed / no write access");
-    MyNotify.NotifyString("alert", "canwrite.noaccess", "Command failed: no CAN write access!");
     return Fail;
     }
 
   if(m_ddt4all_exec > 1) 
     {
-    char msg[100];
-    snprintf(msg, sizeof(msg), "DDT4all command rejected - previous command still processing (%d seconds remaining)",m_ddt4all_exec);
-    ESP_LOGE(TAG, "%s", msg);
-    MyNotify.NotifyString("info", "ddt4all.noaccess", msg);
+    ESP_LOGE(TAG, "DDT4all command rejected - previous command still processing (%d seconds remaining)",m_ddt4all_exec);
     return Fail;
     }
 
@@ -81,11 +77,6 @@ OvmsVehicle::vehicle_command_t  OvmsVehicleSmartEQ::CommandCanVector(uint32_t tx
 
   OvmsVehicle::vehicle_command_t res = Fail;
   res = wakeup ? CommandWakeup() : Success;
-  
-  if (!m_can_last_acc_state) 
-    {
-    smartCANbusAccess(true); // enable CAN write access to send wakeup command
-    }  
 
   vTaskDelay(200 / portTICK_PERIOD_MS);
   if (res == Success)
@@ -451,8 +442,6 @@ OvmsVehicle::vehicle_command_t OvmsVehicleSmartEQ::CommandPreset(int verbosity, 
 
   // Update xsq preset version
   map_xsq["cfg.preset.ver"] = STR(PRESET_VERSION);
-  if (map_xsq.find("charge12v.threshold") == map_xsq.end())
-    map_xsq["charge12v.threshold"] = "11.75";
 
   // modem section - single map operation
   bool need_stream = false;
@@ -484,7 +473,7 @@ OvmsVehicle::vehicle_command_t OvmsVehicleSmartEQ::CommandPreset(int verbosity, 
     if (PRESET_VERSION == PRESET_VERSION_12VREF) 
     {
       m["12v.ref"] = "12.5";
-      m["12v.alert"] = "0.75";
+      m["12v.alert"] = "0.9";
       changed = true;
     }
     if (it_ref == m.end())
@@ -494,7 +483,7 @@ OvmsVehicle::vehicle_command_t OvmsVehicleSmartEQ::CommandPreset(int verbosity, 
       }
     if (it_alert == m.end())
       {
-      m["12v.alert"] = "0.75";
+      m["12v.alert"] = "0.9";
       changed = true;
       }
     if (need_stream)
@@ -537,7 +526,7 @@ OvmsVehicle::vehicle_command_t OvmsVehicleSmartEQ::CommandPreset(int verbosity, 
         tag != m.end() && tag->second == "smarteq")
       {
       srv->second = "https://ovms.dexters-web.de/firmware/ota";
-      tag->second = "main";
+      tag->second = "edge";
       MyConfig.SetParamMap("ota", m);
       }
   }
@@ -639,7 +628,7 @@ OvmsVehicle::vehicle_command_t OvmsVehicleSmartEQ::CommandSetDefault(int verbosi
   // auto section
   auto map_auto = MyConfig.GetParamMap("auto");
   map_auto["init"] = "yes";
-  map_auto["ota"] = "yes";
+  map_auto["ota"] = "no";
   map_auto["modem"] = "yes";
   map_auto["server.v2"] = "yes";
   MyConfig.SetParamMap("auto", map_auto);
@@ -657,14 +646,14 @@ OvmsVehicle::vehicle_command_t OvmsVehicleSmartEQ::CommandSetDefault(int verbosi
   auto map_vehicle = MyConfig.GetParamMap("vehicle");
   map_vehicle["stream"] = "10";
   map_vehicle["12v.ref"] = "12.5";
-  map_vehicle["12v.alert"] = "0.75";
+  map_vehicle["12v.alert"] = "0.9";
   MyConfig.SetParamMap("vehicle", map_vehicle);
 
   // ota section
   auto map_ota = MyConfig.GetParamMap("ota");
   map_ota["server"] = "https://ovms.dexters-web.de/firmware/ota";
   map_ota["tag"] = "main";
-  map_ota["http.mru"] = "https://ovms.dexters-web.de/firmware/ota/v3.3-5/edge/ovms3.bin";
+  map_ota["http.mru"] = "https://ovms.dexters-web.de/firmware/ota/v3.3/edge/ovms3.bin";
   MyConfig.SetParamMap("ota", map_ota);
 
   // network section
@@ -679,8 +668,8 @@ OvmsVehicle::vehicle_command_t OvmsVehicleSmartEQ::CommandSetDefault(int verbosi
   
   if (writer) 
     {
-    writer->puts("smartEQ config reset to defaults");
-    ESP_LOGI(TAG, "smartEQ config reset to defaults");
+    writer->puts("SmartEQ config reset to defaults");
+    ESP_LOGI(TAG, "SmartEQ config reset to defaults");
     }
   
   return Success;

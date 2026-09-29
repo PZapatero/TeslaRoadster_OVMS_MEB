@@ -1,6 +1,6 @@
 # Roadster firmware build
 
-The `Build Roadster min-max firmware` workflow on this branch uses read-only repository access. It checks out upstream commit `362f8742592b8b6bb9fa4238bd6fe0983868eced` (installed firmware `3.3.006-172-g362f87425`), then applies `patches/roadster-ess-minmax.patch` in its temporary build directory. This branch's source tree retains the complete imported upstream source; the workflow explicitly chooses the older device-matching source for compilation.
+The `Build Roadster min-max firmware` workflow on this branch uses read-only repository access. It checks out upstream commit `362f8742592b8b6bb9fa4238bd6fe0983868eced` (installed firmware `3.3.006-172-g362f87425`), then applies `patches/roadster-ess-minmax.patch` in its temporary build directory. This branch contains the complete source tree pinned to that same installed-version base, plus the extension. The workflow independently fetches the fixed upstream base and applies the patch to verify the exact build inputs.
 
 ESP-IDF is pinned to OVMS commit `9063c8662ca5d67b5490c1503bd4377b380feed3` and the compiler is the version referenced by upstream `.travis.yml`.
 

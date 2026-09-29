@@ -75,8 +75,6 @@ void OvmsTelnet::EventHandler(struct mg_connection *nc, int ev, void *p)
 
     case MG_EV_POLL:
       {
-      // Reap consoles whose follow task has exited (deferred by MG_EV_CLOSE).
-      ReapConsoles();
       ConsoleTelnet* child = (ConsoleTelnet*)nc->user_data;
       if (child)
         child->Poll(0);
@@ -94,9 +92,8 @@ void OvmsTelnet::EventHandler(struct mg_connection *nc, int ev, void *p)
     case MG_EV_CLOSE:
       {
       ConsoleTelnet* child = (ConsoleTelnet*)nc->user_data;
-      if (child && !CloseConsole(child))
-        delete child;   // no follow task: synchronous termination + free
-      nc->user_data = NULL;
+      if (child)
+        delete child;
       }
       break;
 
@@ -130,7 +127,7 @@ void OvmsTelnet::NetManInit(std::string event, void* data)
   m_running = true;
 
   ESP_LOGI(tag, "Launching Telnet Server");
-  auto mglock = MongooseLock();
+  auto mglock = console->MongooseLock();
   struct mg_mgr* mgr = MyNetManager.GetMongooseMgr();
   if (!mgr)
     {
@@ -185,10 +182,6 @@ ConsoleTelnet::ConsoleTelnet(struct mg_connection* nc)
 
 ConsoleTelnet::~ConsoleTelnet()
   {
-  // Clean up any interactive command (e.g. a "vfs tail" follow-mode task) bound
-  // to this console before freeing the transport it writes to, otherwise it
-  // would dereference a freed writer/transport.
-  RunTerminationCallback();
   telnet_t *telnet = m_telnet;
   m_telnet = NULL;
   telnet_free(telnet);
@@ -236,14 +229,8 @@ void ConsoleTelnet::TelnetHandler(telnet_event_t *event)
   switch (event->type)
     {
     case TELNET_EV_SEND:
-      {
-      auto mglock = MongooseLock();
-      // Under the lock, re-check closing: once the connection is closing the
-      // mongoose nc (m_connection) may already be freed, so don't touch it.
-      if (!IsClosing())
-        mg_send(m_connection, event->data.buffer, event->data.size);
+      mg_send(m_connection, event->data.buffer, event->data.size);
       break;
-      }
 
     case TELNET_EV_DATA:
       {
@@ -296,10 +283,7 @@ int ConsoleTelnet::printf(const char* fmt, ...)
 
 ssize_t ConsoleTelnet::write(const void *buf, size_t nbyte)
   {
-  // m_closing is checked first on purpose: once the connection is closing the
-  // mongoose nc (m_connection) may already be freed, so short-circuit before
-  // dereferencing it. Same reason TelnetHandler bails on IsClosing() first.
-  if (m_closing || !m_telnet || (m_connection->flags & MG_F_SEND_AND_CLOSE))
+  if (!m_telnet || (m_connection->flags & MG_F_SEND_AND_CLOSE))
     return 0;
   telnet_send_text(m_telnet, (const char*)buf, nbyte);
   return nbyte;

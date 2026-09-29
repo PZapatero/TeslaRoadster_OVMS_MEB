@@ -92,11 +92,9 @@ THE USE OR OTHER DEALINGS IN THE SYSTEM.
   - [Renault Zoe Phase 2](https://docs.openvehicles.com/en/latest/components/vehicle_renaultzoe_ph2/docs/index.html)
   - [Smart ED Gen.3](https://docs.openvehicles.com/en/latest/components/vehicle_smarted/docs/index.html)
   - [Smart ED/EQ Gen.4 (453)](https://docs.openvehicles.com/en/latest/components/vehicle_smarteq/docs/index.html)
-  - [Subaru Solterra](https://docs.openvehicles.com/en/latest/components/vehicle_subaru_solterra/docs/index.html)
   - [Tesla Model S](https://docs.openvehicles.com/en/latest/components/vehicle_teslamodels/docs/index.html)
   - [Tesla Roadster](https://docs.openvehicles.com/en/latest/components/vehicle_teslaroadster/docs/index.html)
   - Think City
-  - [Toyota bZ4X](https://docs.openvehicles.com/en/latest/components/vehicle_toyota_bz4x/docs/index.html)
   - [Toyota RAV4 EV](https://docs.openvehicles.com/en/latest/components/vehicle_toyotarav4ev/docs/index.html)
   - [VW e-Golf](https://docs.openvehicles.com/en/latest/components/vehicle_vwegolf/docs/index.html)
   - [VW e-Up / Skoda Citigo / Seat Mii](https://docs.openvehicles.com/en/latest/components/vehicle_vweup/docs/index.html)
@@ -104,7 +102,6 @@ THE USE OR OTHER DEALINGS IN THE SYSTEM.
   - [DBC File Based](https://docs.openvehicles.com/en/latest/components/vehicle_dbc/docs/index.html)
   - [GPS Tracking](https://docs.openvehicles.com/en/latest/components/vehicle_track/docs/index.html)
   - [OBD-II Standard](https://docs.openvehicles.com/en/latest/components/vehicle_obdii/docs/index.html)
-  - [Toyota e-TNGA platform](https://docs.openvehicles.com/en/latest/components/vehicle_toyota_etnga/docs/index.html)
   - Zeva BMS
   - [ZombieVerter VCU](https://docs.openvehicles.com/en/latest/components/vehicle_zombie_vcu/docs/index.html)
 
@@ -125,7 +122,7 @@ THE USE OR OTHER DEALINGS IN THE SYSTEM.
     - [Medlock & Sons (North America)](https://medlockandsons.com/product/ovms-v3/)
     - [OpenEnergyMonitor (UK/Europe)](https://shop.openenergymonitor.com/ovms/)
   - _Customized Versions_
-    - [Optimized compact casing not only for Smart ED/EQ (Germany/Europe)](https://www.smart-emotion.de/shop/product/75-ovms-independent-app/) -- **Att**: this version only supports the first two CAN buses, CAN3 and SWCAN are not supported!
+    - [Optimized compact casing not only for Smart ED/EQ (Germany/Europe)](https://www.smart-emotion.de/shop/product/75-ovms-independent-app/)
 - _Servers_
   - [Asia-Pacific](https://www.openvehicles.com/)
   - [Germany/Europe](https://dexters-web.de/)
@@ -300,10 +297,6 @@ SOFTWARE.
 
 Software which uses other licenses will be annotated appropriately.
 
-## Tesla Roadster MEB min/max extension
+## Tesla Roadster MEB min/max
 
-This repository includes the complete upstream OVMS source and the Roadster
-voltage/temperature min/max monitor. See
-`vehicle/OVMS.V3/components/vehicle_teslaroadster/README-MEB.md`.
-Base upstream commit: `86dfa0afe4a8c5b2978ef069caedac661627b180`.
-Firmware build and vehicle validation are pending.
+This complete source tree matches base 3.3.006-172-g362f87425 and includes the passive voltage/temperature min/max extension. See BUILD-ROADSTER.md for the version-matching build and hardware compatibility checks.
