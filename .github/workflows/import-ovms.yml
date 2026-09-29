@@ -1,0 +1,50 @@
+name: Import complete OVMS source
+on:
+  push:
+    branches: [teslaroadster-meb]
+    paths: [.github/workflows/import-ovms.yml]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Import upstream and retain min/max extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git cat-file -e HEAD:vehicle/OVMS.V3/main/ovms.cpp 2>/dev/null; then
+            echo "Full OVMS source is already present."
+            exit 0
+          fi
+          git show HEAD:patches/roadster-ess-minmax.patch > "$RUNNER_TEMP/roadster-ess-minmax.patch"
+          cp .github/workflows/import-ovms.yml "$RUNNER_TEMP/import-ovms.yml"
+          original_head=$(git rev-parse HEAD)
+          git remote add ovms https://github.com/openvehicles/Open-Vehicle-Monitoring-System-3.git
+          git fetch --no-tags ovms 86dfa0afe4a8c5b2978ef069caedac661627b180
+          upstream_head=$(git rev-parse FETCH_HEAD)
+          git read-tree --reset -u "$upstream_head"
+          git apply "$RUNNER_TEMP/roadster-ess-minmax.patch"
+          mkdir -p patches .github/workflows
+          cp "$RUNNER_TEMP/roadster-ess-minmax.patch" patches/roadster-ess-minmax.patch
+          cp "$RUNNER_TEMP/import-ovms.yml" .github/workflows/import-ovms.yml
+          cat >> README.md <<'EOF'
+
+          ## Tesla Roadster MEB min/max extension
+
+          This repository includes the complete upstream OVMS source and the Roadster
+          voltage/temperature min/max monitor. See
+          `vehicle/OVMS.V3/components/vehicle_teslaroadster/README-MEB.md`.
+          Base upstream commit: `86dfa0afe4a8c5b2978ef069caedac661627b180`.
+          Firmware build and vehicle validation are pending.
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          imported_tree=$(git write-tree)
+          imported_commit=$(git commit-tree "$imported_tree" -p "$original_head" -p "$upstream_head" -m "Import complete OVMS source with Roadster ESS min/max monitor")
+          git push origin "$imported_commit:refs/heads/teslaroadster-meb"
