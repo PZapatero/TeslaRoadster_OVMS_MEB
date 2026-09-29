@@ -187,6 +187,7 @@ void OvmsVehicleTeslaRoadster::Status(int verbosity, OvmsWriter* writer)
 
 void OvmsVehicleTeslaRoadster::IncomingFrameCan3(CAN_frame_t* p_frame)
   {
+  OvmsRecMutexLock lock(&m_ess_mutex);
   if (m_ess_minmax.Decode(p_frame->MsgID, p_frame->data.u8, p_frame->FIR.B.DLC,
       p_frame->FIR.B.FF != CAN_frame_std, p_frame->FIR.B.RTR != 0, monotonictime))
     UpdateEssMinMax();
@@ -194,6 +195,7 @@ void OvmsVehicleTeslaRoadster::IncomingFrameCan3(CAN_frame_t* p_frame)
 
 void OvmsVehicleTeslaRoadster::UpdateEssMinMax()
   {
+  OvmsRecMutexLock lock(&m_ess_mutex);
   float min, max;
   const bool voltage_valid = m_ess_minmax.Voltage(monotonictime, min, max);
   m_ess_voltage_valid->SetValue(voltage_valid);

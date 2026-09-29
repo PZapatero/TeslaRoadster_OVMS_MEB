@@ -2,7 +2,7 @@ name: Build Roadster min-max firmware
 on:
   push:
     branches: [roadster-3.3.006-minmax]
-    paths: [.github/workflows/build-roadster.yml]
+    paths: [.github/workflows/build-roadster.yml, patches/roadster-ess-minmax.patch, 'vehicle/OVMS.V3/components/vehicle_teslaroadster/**']
   workflow_dispatch:
 permissions:
   contents: read
@@ -45,8 +45,10 @@ jobs:
           mkdir -p /opt/ovms-esp
           curl --fail --location --retry 3 https://dl.espressif.com/dl/xtensa-esp32-elf-linux64-1.22.0-97-gc752ad5-5.2.0.tar.gz -o /tmp/xtensa.tar.gz
           tar -xzf /tmp/xtensa.tar.gz -C /opt/ovms-esp
-          git clone https://github.com/openvehicles/esp-idf.git "$IDF_PATH"
-          git -C "$IDF_PATH" checkout 9063c8662ca5d67b5490c1503bd4377b380feed3
+          git init "$IDF_PATH"
+          git -C "$IDF_PATH" remote add origin https://github.com/openvehicles/esp-idf.git
+          git -C "$IDF_PATH" fetch --depth 1 origin 9063c8662ca5d67b5490c1503bd4377b380feed3
+          git -C "$IDF_PATH" checkout --detach FETCH_HEAD
           git -C "$IDF_PATH" submodule update --init --recursive
           python3 -m pip install 'setuptools<70' 'pyparsing<3' 'cryptography<43' pyserial future
       - name: Build hardware 3.1 candidate
