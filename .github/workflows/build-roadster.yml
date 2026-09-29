@@ -22,6 +22,8 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
+      - name: Trust this checked-out repository
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Check out the installed firmware base for this build
         shell: bash
         run: |
