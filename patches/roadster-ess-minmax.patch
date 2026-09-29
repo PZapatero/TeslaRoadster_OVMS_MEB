@@ -1,0 +1,400 @@
+diff --git a/vehicle/OVMS.V3/components/vehicle_teslaroadster/README-MEB.md b/vehicle/OVMS.V3/components/vehicle_teslaroadster/README-MEB.md
+new file mode 100644
+index 000000000..e5a22664c
+--- /dev/null
++++ b/vehicle/OVMS.V3/components/vehicle_teslaroadster/README-MEB.md
+@@ -0,0 +1,53 @@
++# Roadster ESS min/max monitor
++
++The Roadster module registers OVMS CAN3 in listen-only mode at 125 kbit/s
++(OVT1 wiring: Roadster CAN2/ESS). It sends no requests on that bus.
++
++Vehicle → Battery Min/Max (`/xtr/ess`) displays only:
++
++| Metric | Meaning |
++| --- | --- |
++| `v.b.p.voltage.min` | Lowest reported brick voltage, V |
++| `v.b.p.voltage.max` | Highest reported brick voltage, V |
++| `v.b.p.temp.min` | Lowest reported cell temperature, °C |
++| `v.b.p.temp.max` | Highest reported cell temperature, °C |
++
++The same values appear in `stat`. No individual brick/sensor values or indices
++are published. Existing CAN1 functionality is unchanged.
++
++## Source and validity
++
++Signal layout comes from the supplied `Roadster_2_0_ESS_Bus.dbc` reference:
++sheet voltage extrema use IDs `0x08A + 8*n`, temperatures `0x08C + 8*n`,
++where `n=0..10`. Both messages are standard CAN data frames with DLC 8.
++Bytes 0–1 and 2–3 carry minimum and maximum, little-endian.
++Voltage is unsigned at 1/8192 V; temperature is signed at 1/256 °C.
++
++The decoder keeps only these two extrema per sheet, then aggregates all eleven
++sheets. Voltage and temperature coverage are independent. A pair is unavailable
++until every sheet has supplied valid ordered extrema in the last 30 seconds.
++Missing/expired data clears the standard metrics; two internal validity flags
++(`xtr.b.voltage.valid`, `xtr.b.temp.valid`) prevent the web interface from
++displaying OVMS's JSON fallback zero as a real measurement. The page displays
++`?` while unavailable. Sleeping vehicles or long report intervals may therefore
++show `?`. Data from different sheets is asynchronous, with a maximum age of 30 s.
++
++These are **Roadster-side reported values**. With an MEB translator they may
++already be mapped/filtered. This does not add a raw MEB telemetry protocol or
++decode a speculative `0x6F0` message. The translator must already publish the
++native sheet summary messages for this monitor to display values.
++
++## Host verification
++
++From this component directory:
++
++```sh
++g++ -std=c++11 -Wall -Wextra -Werror -pedantic -Isrc tests/ess_minmax.cpp -o /tmp/roadster-ess-tests
++/tmp/roadster-ess-tests
++```
++
++Tests cover full-sheet coverage, signed temperatures, changing extrema,
++malformed/unrelated frames, expiration and uptime wrap. `--replay` accepts
++records containing decimal seconds, hexadecimal CAN ID and eight decimal
++bytes. This validates the decoder independently of ESP-IDF; it does not replace
++a complete firmware build or an on-vehicle test.
+diff --git a/vehicle/OVMS.V3/components/vehicle_teslaroadster/src/roadster_ess_minmax.h b/vehicle/OVMS.V3/components/vehicle_teslaroadster/src/roadster_ess_minmax.h
+new file mode 100644
+index 000000000..aa0fddcd9
+--- /dev/null
++++ b/vehicle/OVMS.V3/components/vehicle_teslaroadster/src/roadster_ess_minmax.h
+@@ -0,0 +1,72 @@
++// Roadster_2_0_ESS_Bus.dbc: BMB_MinMaxAvgV/T, sheets 1..11.
++// Keep only sheet extrema; never publish individual bricks or sensor indices.
++#ifndef ROADSTER_ESS_MINMAX_H
++#define ROADSTER_ESS_MINMAX_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++class RoadsterEssMinMax
++  {
++  public:
++    static constexpr unsigned Sheets = 11;
++    static constexpr uint32_t MaxAge = 30; // seconds; all sheets must be fresh
++
++    bool Decode(uint32_t id, const uint8_t* data, size_t length,
++                bool extended, bool remote, uint32_t now)
++      {
++      if (extended || remote || length != 8 || id < 0x08a || id > 0x0dc)
++        return false;
++      const unsigned offset = id - 0x08a;
++      const unsigned kind = offset % 8;
++      if (kind != 0 && kind != 2)
++        return false;
++      const unsigned sheet = offset / 8;
++      if (sheet >= Sheets)
++        return false;
++      Pair& pair = kind == 0 ? m_voltage[sheet] : m_temperature[sheet];
++      const uint16_t low = data[0] | (uint16_t(data[1]) << 8);
++      const uint16_t high = data[2] | (uint16_t(data[3]) << 8);
++      // Temperatures are signed little-endian, 1/256 degree Celsius.
++      pair.min = kind == 0 ? low / 8192.0f : Signed(low) / 256.0f;
++      pair.max = kind == 0 ? high / 8192.0f : Signed(high) / 256.0f;
++      pair.time = now;
++      pair.seen = pair.min <= pair.max;
++      return true;
++      }
++
++    bool Voltage(uint32_t now, float& min, float& max) const
++      { return Aggregate(m_voltage, now, min, max); }
++    bool Temperature(uint32_t now, float& min, float& max) const
++      { return Aggregate(m_temperature, now, min, max); }
++
++  private:
++    struct Pair
++      {
++      float min = 0, max = 0;
++      uint32_t time = 0;
++      bool seen = false;
++      };
++    Pair m_voltage[Sheets];
++    Pair m_temperature[Sheets];
++
++    static int32_t Signed(uint16_t value)
++      { return value & 0x8000 ? int32_t(value) - 65536 : value; }
++
++    static bool Aggregate(const Pair* pairs, uint32_t now, float& min, float& max)
++      {
++      for (unsigned i = 0; i < Sheets; ++i)
++        if (!pairs[i].seen || uint32_t(now - pairs[i].time) >= MaxAge)
++          return false;
++      min = pairs[0].min;
++      max = pairs[0].max;
++      for (unsigned i = 1; i < Sheets; ++i)
++        {
++        if (pairs[i].min < min) min = pairs[i].min;
++        if (pairs[i].max > max) max = pairs[i].max;
++        }
++      return true;
++      }
++  };
++
++#endif
+diff --git a/vehicle/OVMS.V3/components/vehicle_teslaroadster/src/vehicle_teslaroadster.cpp b/vehicle/OVMS.V3/components/vehicle_teslaroadster/src/vehicle_teslaroadster.cpp
+index 85f71ef5f..32d73dbfa 100644
+--- a/vehicle/OVMS.V3/components/vehicle_teslaroadster/src/vehicle_teslaroadster.cpp
++++ b/vehicle/OVMS.V3/components/vehicle_teslaroadster/src/vehicle_teslaroadster.cpp
+@@ -121,6 +121,15 @@ OvmsVehicleTeslaRoadster::OvmsVehicleTeslaRoadster()
+   MyConfig.RegisterParam("xtr", "Tesla Roadster", true, true);
+ 
+   RegisterCanBus(1,CAN_MODE_ACTIVE,CAN_SPEED_1000KBPS);
++  // OVT1: OVMS CAN3 is Roadster CAN2/ESS. Diagnostic receive only.
++  m_ess_voltage_valid = MyMetrics.InitBool("xtr.b.voltage.valid", SM_STALE_MID);
++  m_ess_temperature_valid = MyMetrics.InitBool("xtr.b.temp.valid", SM_STALE_MID);
++  UpdateEssMinMax();
++  RegisterCanBus(3,CAN_MODE_LISTEN,CAN_SPEED_125KBPS);
++#ifdef CONFIG_OVMS_COMP_WEBSERVER
++  MyWebServer.RegisterPage("/xtr/ess", "Battery Min/Max", WebEssMinMax,
++    PageMenu_Vehicle, PageAuth_Cookie);
++#endif
+ 
+   MyTeslaRoadster = this;
+   }
+@@ -130,6 +139,15 @@ OvmsVehicleTeslaRoadster::~OvmsVehicleTeslaRoadster()
+   ESP_LOGI(TAG, "Shutdown Tesla Roadster vehicle module");
+ 
+   MyTeslaRoadster = NULL;
++  m_ess_voltage_valid->SetValue(false);
++  m_ess_temperature_valid->SetValue(false);
++  StandardMetrics.ms_v_bat_pack_vmin->Clear();
++  StandardMetrics.ms_v_bat_pack_vmax->Clear();
++  StandardMetrics.ms_v_bat_pack_tmin->Clear();
++  StandardMetrics.ms_v_bat_pack_tmax->Clear();
++#ifdef CONFIG_OVMS_COMP_WEBSERVER
++  MyWebServer.DeregisterPage("/xtr/ess");
++#endif
+ 
+   if (m_speedo_running)
+     {
+@@ -143,6 +161,12 @@ OvmsVehicleTeslaRoadster::~OvmsVehicleTeslaRoadster()
+ void OvmsVehicleTeslaRoadster::Status(int verbosity, OvmsWriter* writer)
+   {
+   writer->printf("Vehicle: Tesla Roadster %s (%s)\n",m_type,m_vin);
++  writer->printf("Cell voltage min/max: %s / %s\n",
++    StandardMetrics.ms_v_bat_pack_vmin->AsUnitString("unavailable", Volts, 3).c_str(),
++    StandardMetrics.ms_v_bat_pack_vmax->AsUnitString("unavailable", Volts, 3).c_str());
++  writer->printf("Cell temperature min/max: %s / %s\n",
++    StandardMetrics.ms_v_bat_pack_tmin->AsUnitString("unavailable", Celcius, 1).c_str(),
++    StandardMetrics.ms_v_bat_pack_tmax->AsUnitString("unavailable", Celcius, 1).c_str());
+ 
+   if (m_cooldown_running)
+     {
+@@ -161,6 +185,79 @@ void OvmsVehicleTeslaRoadster::Status(int verbosity, OvmsWriter* writer)
+     }
+   }
+ 
++void OvmsVehicleTeslaRoadster::IncomingFrameCan3(CAN_frame_t* p_frame)
++  {
++  if (m_ess_minmax.Decode(p_frame->MsgID, p_frame->data.u8, p_frame->FIR.B.DLC,
++      p_frame->FIR.B.FF != CAN_frame_std, p_frame->FIR.B.RTR != 0, monotonictime))
++    UpdateEssMinMax();
++  }
++
++void OvmsVehicleTeslaRoadster::UpdateEssMinMax()
++  {
++  float min, max;
++  const bool voltage_valid = m_ess_minmax.Voltage(monotonictime, min, max);
++  m_ess_voltage_valid->SetValue(voltage_valid);
++  if (voltage_valid)
++    {
++    StandardMetrics.ms_v_bat_pack_vmin->SetValue(min, Volts);
++    StandardMetrics.ms_v_bat_pack_vmax->SetValue(max, Volts);
++    }
++  else
++    {
++    if (StandardMetrics.ms_v_bat_pack_vmin->IsDefined()) StandardMetrics.ms_v_bat_pack_vmin->Clear();
++    if (StandardMetrics.ms_v_bat_pack_vmax->IsDefined()) StandardMetrics.ms_v_bat_pack_vmax->Clear();
++    }
++  const bool temperature_valid = m_ess_minmax.Temperature(monotonictime, min, max);
++  m_ess_temperature_valid->SetValue(temperature_valid);
++  if (temperature_valid)
++    {
++    StandardMetrics.ms_v_bat_pack_tmin->SetValue(min, Celcius);
++    StandardMetrics.ms_v_bat_pack_tmax->SetValue(max, Celcius);
++    }
++  else
++    {
++    if (StandardMetrics.ms_v_bat_pack_tmin->IsDefined()) StandardMetrics.ms_v_bat_pack_tmin->Clear();
++    if (StandardMetrics.ms_v_bat_pack_tmax->IsDefined()) StandardMetrics.ms_v_bat_pack_tmax->Clear();
++    }
++  }
++
++#ifdef CONFIG_OVMS_COMP_WEBSERVER
++void OvmsVehicleTeslaRoadster::WebEssMinMax(PageEntry_t& p, PageContext_t& c)
++  {
++  c.head(200);
++  c.panel_start("primary", "Battery Min/Max");
++  c.print("<style>#xtr-ess .ess-value{padding:12px;border-bottom:1px solid #ddd;}"
++    "#xtr-ess .control-label{display:block;}#xtr-ess .value{font-size:24px;}</style>"
++    "<div id=\"xtr-ess\" class=\"receiver\"><div class=\"clearfix\">"
++    "<div class=\"ess-value\" data-metric=\"v.b.p.voltage.min\" data-prec=\"3\">"
++    "<span class=\"control-label\">Cell voltage min</span> <span class=\"value\">?</span> <span class=\"unit\">V</span></div>"
++    "<div class=\"ess-value\" data-metric=\"v.b.p.voltage.max\" data-prec=\"3\">"
++    "<span class=\"control-label\">Cell voltage max</span> <span class=\"value\">?</span> <span class=\"unit\">V</span></div>"
++    "<div class=\"ess-value\" data-metric=\"v.b.p.temp.min\" data-prec=\"1\">"
++    "<span class=\"control-label\">Cell temperature min</span> <span class=\"value\">?</span> <span class=\"unit\">°C</span></div>"
++    "<div class=\"ess-value\" data-metric=\"v.b.p.temp.max\" data-prec=\"1\">"
++    "<span class=\"control-label\">Cell temperature max</span> <span class=\"value\">?</span> <span class=\"unit\">°C</span></div>"
++    "</div></div>");
++  c.print(R"(<script>
++(function(){
++  var root = $("#xtr-ess");
++  function refresh() {
++    root.find(".ess-value").each(function(){
++      var el = $(this), name = el.data("metric");
++      var valid = metrics[name.indexOf("voltage") >= 0 ? "xtr.b.voltage.valid" : "xtr.b.temp.valid"];
++      var value = metrics[name];
++      el.find(".value").text(valid && value != null ? Number(value).toFixed(el.data("prec")) : "?");
++    });
++  }
++  root.on("msg:metrics", refresh);
++  refresh();
++})();
++</script>)");
++  c.panel_end();
++  c.done();
++  }
++#endif
++
+ void OvmsVehicleTeslaRoadster::IncomingFrameCan1(CAN_frame_t* p_frame)
+   {
+   uint8_t *d = p_frame->data.u8;
+@@ -661,6 +758,7 @@ void OvmsVehicleTeslaRoadster::NotifiedVehicleOff()
+ 
+ void OvmsVehicleTeslaRoadster::Ticker1(uint32_t ticker)
+   {
++  UpdateEssMinMax();
+   if ((m_cooldown_running)&&(StandardMetrics.ms_v_charge_inprogress->AsBool()))
+     {
+     // Cooldown is running, and car is charging
+diff --git a/vehicle/OVMS.V3/components/vehicle_teslaroadster/src/vehicle_teslaroadster.h b/vehicle/OVMS.V3/components/vehicle_teslaroadster/src/vehicle_teslaroadster.h
+index df01e23b3..fa8acb1b1 100644
+--- a/vehicle/OVMS.V3/components/vehicle_teslaroadster/src/vehicle_teslaroadster.h
++++ b/vehicle/OVMS.V3/components/vehicle_teslaroadster/src/vehicle_teslaroadster.h
+@@ -33,6 +33,10 @@
+ 
+ #include "freertos/timers.h"
+ #include "vehicle.h"
++#include "roadster_ess_minmax.h"
++#ifdef CONFIG_OVMS_COMP_WEBSERVER
++#include "ovms_webserver.h"
++#endif
+ 
+ using namespace std;
+ 
+@@ -44,6 +48,11 @@ class OvmsVehicleTeslaRoadster : public OvmsVehicle
+ 
+   public:
+     void IncomingFrameCan1(CAN_frame_t* p_frame);
++    void IncomingFrameCan3(CAN_frame_t* p_frame) override;
++
++#ifdef CONFIG_OVMS_COMP_WEBSERVER
++    static void WebEssMinMax(PageEntry_t& p, PageContext_t& c);
++#endif
+ 
+   public:
+     vehicle_command_t CommandSetChargeMode(vehicle_mode_t mode) override;
+@@ -112,6 +121,11 @@ class OvmsVehicleTeslaRoadster : public OvmsVehicle
+     void ChargeTimePredictor();
+ 
+   protected:
++    RoadsterEssMinMax m_ess_minmax;
++    OvmsMetricBool* m_ess_voltage_valid;
++    OvmsMetricBool* m_ess_temperature_valid;
++    void UpdateEssMinMax();
++
+     char m_vin[18];
+     char m_type[5];
+     bool m_aux12v; // True if auxiliary 12v system is on
+diff --git a/vehicle/OVMS.V3/components/vehicle_teslaroadster/tests/ess_minmax.cpp b/vehicle/OVMS.V3/components/vehicle_teslaroadster/tests/ess_minmax.cpp
+new file mode 100644
+index 000000000..c4e46da61
+--- /dev/null
++++ b/vehicle/OVMS.V3/components/vehicle_teslaroadster/tests/ess_minmax.cpp
+@@ -0,0 +1,81 @@
++#include "roadster_ess_minmax.h"
++#include <assert.h>
++#include <cmath>
++#include <iostream>
++#include <string>
++
++static void Put(uint8_t* d, int low, int high)
++  {
++  d[0] = low & 255; d[1] = (low >> 8) & 255;
++  d[2] = high & 255; d[3] = (high >> 8) & 255;
++  }
++
++int main(int argc, char** argv)
++  {
++  RoadsterEssMinMax ess;
++  uint8_t d[8] = {};
++  float low = 0, high = 0;
++  if (argc == 2 && std::string(argv[1]) == "--replay")
++    {
++    uint32_t now, id;
++    unsigned byte, decoded = 0, voltage = 0, temperature = 0;
++    while (std::cin >> now >> std::hex >> id >> std::dec)
++      {
++      for (auto& b : d) { std::cin >> byte; b = byte; }
++      if (ess.Decode(id, d, 8, false, false, now)) ++decoded;
++      if (ess.Voltage(now, low, high)) ++voltage;
++      if (ess.Temperature(now, low, high)) ++temperature;
++      }
++    std::cout << "decoded=" << decoded << " full_voltage=" << voltage
++              << " full_temperature=" << temperature << '\n';
++    return decoded && voltage && temperature ? 0 : 1;
++    }
++
++  // No partial-pack extrema: voltage/temperature coverage is independent.
++  assert(!ess.Voltage(0, low, high));
++  for (unsigned sheet = 0; sheet < 11; ++sheet)
++    {
++    Put(d, 30000 - sheet * 10, 32000 + sheet * 10);
++    assert(ess.Decode(0x08a + sheet * 8, d, 8, false, false, 100));
++    assert(ess.Voltage(100, low, high) == (sheet == 10));
++    }
++  assert(std::fabs(low - 29900 / 8192.0f) < 0.00001f);
++  assert(std::fabs(high - 32100 / 8192.0f) < 0.00001f);
++  assert(!ess.Temperature(100, low, high));
++  // Negative temperatures must retain their sign.
++  for (unsigned sheet = 0; sheet < 11; ++sheet)
++    {
++    Put(d, -256 * int(sheet), 256 * int(sheet + 20));
++    assert(ess.Decode(0x08c + sheet * 8, d, 8, false, false, 100));
++    }
++  assert(ess.Temperature(100, low, high));
++  assert(low == -10 && high == 30);
++  // A previous extreme must disappear when its sheet changes.
++  Put(d, 0, 20 * 256);
++  ess.Decode(0x0dc, d, 8, false, false, 101);
++  assert(ess.Temperature(101, low, high));
++  assert(low == -9 && high == 29);
++  // Incomplete frames, other IDs and other frame formats are ignored.
++  assert(!ess.Decode(0x08a, d, 4, false, false, 101));
++  assert(!ess.Decode(0x08a, d, 8, true, false, 101));
++  assert(!ess.Decode(0x08a, d, 8, false, true, 101));
++  assert(!ess.Decode(0x088, d, 8, false, false, 101));
++  assert(!ess.Decode(0x08b, d, 8, false, false, 101));
++  assert(!ess.Decode(0x0e2, d, 8, false, false, 101));
++  // Missing sheet data expires, even while other sheets keep transmitting.
++  assert(ess.Voltage(129, low, high));
++  assert(!ess.Voltage(130, low, high));
++  assert(!ess.Temperature(130, low, high));
++  // Invalid ordered extrema invalidate that sheet instead of hiding a fault.
++  Put(d, 32000, 30000);
++  ess.Decode(0x08a, d, 8, false, false, 101);
++  assert(!ess.Voltage(101, low, high));
++  // Freshness subtraction remains correct across uint32_t uptime wrap.
++  RoadsterEssMinMax wrap;
++  Put(d, 30000, 32000);
++  for (unsigned i = 0; i < 11; ++i)
++    wrap.Decode(0x08a + i * 8, d, 8, false, false, UINT32_MAX - 10);
++  assert(wrap.Voltage(5, low, high));
++  assert(!wrap.Voltage(20, low, high));
++  std::cout << "ESS min/max tests passed\n";
++  }
