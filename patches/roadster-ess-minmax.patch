@@ -136,7 +136,7 @@ index 000000000..aa0fddcd9
 +
 +#endif
 diff --git a/vehicle/OVMS.V3/components/vehicle_teslaroadster/src/vehicle_teslaroadster.cpp b/vehicle/OVMS.V3/components/vehicle_teslaroadster/src/vehicle_teslaroadster.cpp
-index 85f71ef5f..32d73dbfa 100644
+index 85f71ef5f..aa971b296 100644
 --- a/vehicle/OVMS.V3/components/vehicle_teslaroadster/src/vehicle_teslaroadster.cpp
 +++ b/vehicle/OVMS.V3/components/vehicle_teslaroadster/src/vehicle_teslaroadster.cpp
 @@ -121,6 +121,15 @@ OvmsVehicleTeslaRoadster::OvmsVehicleTeslaRoadster()
@@ -184,12 +184,13 @@ index 85f71ef5f..32d73dbfa 100644
  
    if (m_cooldown_running)
      {
-@@ -161,6 +185,79 @@ void OvmsVehicleTeslaRoadster::Status(int verbosity, OvmsWriter* writer)
+@@ -161,6 +185,81 @@ void OvmsVehicleTeslaRoadster::Status(int verbosity, OvmsWriter* writer)
      }
    }
  
 +void OvmsVehicleTeslaRoadster::IncomingFrameCan3(CAN_frame_t* p_frame)
 +  {
++  OvmsRecMutexLock lock(&m_ess_mutex);
 +  if (m_ess_minmax.Decode(p_frame->MsgID, p_frame->data.u8, p_frame->FIR.B.DLC,
 +      p_frame->FIR.B.FF != CAN_frame_std, p_frame->FIR.B.RTR != 0, monotonictime))
 +    UpdateEssMinMax();
@@ -197,6 +198,7 @@ index 85f71ef5f..32d73dbfa 100644
 +
 +void OvmsVehicleTeslaRoadster::UpdateEssMinMax()
 +  {
++  OvmsRecMutexLock lock(&m_ess_mutex);
 +  float min, max;
 +  const bool voltage_valid = m_ess_minmax.Voltage(monotonictime, min, max);
 +  m_ess_voltage_valid->SetValue(voltage_valid);
@@ -264,7 +266,7 @@ index 85f71ef5f..32d73dbfa 100644
  void OvmsVehicleTeslaRoadster::IncomingFrameCan1(CAN_frame_t* p_frame)
    {
    uint8_t *d = p_frame->data.u8;
-@@ -661,6 +758,7 @@ void OvmsVehicleTeslaRoadster::NotifiedVehicleOff()
+@@ -661,6 +760,7 @@ void OvmsVehicleTeslaRoadster::NotifiedVehicleOff()
  
  void OvmsVehicleTeslaRoadster::Ticker1(uint32_t ticker)
    {
@@ -273,7 +275,7 @@ index 85f71ef5f..32d73dbfa 100644
      {
      // Cooldown is running, and car is charging
 diff --git a/vehicle/OVMS.V3/components/vehicle_teslaroadster/src/vehicle_teslaroadster.h b/vehicle/OVMS.V3/components/vehicle_teslaroadster/src/vehicle_teslaroadster.h
-index df01e23b3..fa8acb1b1 100644
+index df01e23b3..0706c6b21 100644
 --- a/vehicle/OVMS.V3/components/vehicle_teslaroadster/src/vehicle_teslaroadster.h
 +++ b/vehicle/OVMS.V3/components/vehicle_teslaroadster/src/vehicle_teslaroadster.h
 @@ -33,6 +33,10 @@
@@ -299,10 +301,11 @@ index df01e23b3..fa8acb1b1 100644
  
    public:
      vehicle_command_t CommandSetChargeMode(vehicle_mode_t mode) override;
-@@ -112,6 +121,11 @@ class OvmsVehicleTeslaRoadster : public OvmsVehicle
+@@ -112,6 +121,12 @@ class OvmsVehicleTeslaRoadster : public OvmsVehicle
      void ChargeTimePredictor();
  
    protected:
++    OvmsRecMutex m_ess_mutex;
 +    RoadsterEssMinMax m_ess_minmax;
 +    OvmsMetricBool* m_ess_voltage_valid;
 +    OvmsMetricBool* m_ess_temperature_valid;

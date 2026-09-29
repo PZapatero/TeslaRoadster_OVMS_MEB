@@ -121,6 +121,7 @@ class OvmsVehicleTeslaRoadster : public OvmsVehicle
     void ChargeTimePredictor();
 
   protected:
+    OvmsRecMutex m_ess_mutex;
     RoadsterEssMinMax m_ess_minmax;
     OvmsMetricBool* m_ess_voltage_valid;
     OvmsMetricBool* m_ess_temperature_valid;
