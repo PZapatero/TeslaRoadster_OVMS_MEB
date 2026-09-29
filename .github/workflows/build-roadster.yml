@@ -1,0 +1,62 @@
+name: Build Roadster min-max firmware
+on:
+  push:
+    branches: [teslaroadster-meb]
+    paths: [.github/workflows/build-roadster.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    container: ubuntu:20.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      IDF_PATH: /opt/ovms-esp/esp-idf
+    steps:
+      - name: Install build prerequisites
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends git ca-certificates curl make gcc g++ gperf bison flex libncurses-dev python3 python3-pip python-is-python3 dos2unix libffi-dev libssl-dev
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Verify min-max decoder
+        run: |
+          cd vehicle/OVMS.V3/components/vehicle_teslaroadster
+          g++ -std=c++11 -Wall -Wextra -Werror -pedantic -Isrc tests/ess_minmax.cpp -o /tmp/ess-tests
+          /tmp/ess-tests
+      - name: Install pinned OVMS ESP-IDF and compiler
+        run: |
+          mkdir -p /opt/ovms-esp
+          curl --fail --location --retry 3 https://dl.espressif.com/dl/xtensa-esp32-elf-linux64-1.22.0-97-gc752ad5-5.2.0.tar.gz -o /tmp/xtensa.tar.gz
+          tar -xzf /tmp/xtensa.tar.gz -C /opt/ovms-esp
+          git clone https://github.com/openvehicles/esp-idf.git "$IDF_PATH"
+          git -C "$IDF_PATH" checkout 9063c8662ca5d67b5490c1503bd4377b380feed3
+          git -C "$IDF_PATH" submodule update --init --recursive
+          python3 -m pip install 'setuptools<70' 'pyparsing<3' 'cryptography<43' pyserial future
+      - name: Build hardware 3.1 candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="/opt/ovms-esp/xtensa-esp32-elf/bin:$PATH"
+          cp vehicle/OVMS.V3/support/sdkconfig.default.hw31 vehicle/OVMS.V3/sdkconfig
+          make -C vehicle/OVMS.V3 -j2 2>&1 | tee build-roadster.log
+          mkdir -p firmware-output
+          cp vehicle/OVMS.V3/build/ovms3.bin firmware-output/ovms3-roadster-minmax-hw31.bin
+          cp vehicle/OVMS.V3/sdkconfig firmware-output/sdkconfig.hw31
+          git rev-parse HEAD > firmware-output/source-commit.txt
+          sha256sum firmware-output/*.bin > firmware-output/SHA256SUMS
+          printf '%s\n' 'Build candidate for OVMS hardware 3.1 / 16 MB flash.' 'Hardware and installed firmware compatibility have not been verified on the vehicle.' 'Do not flash until the device version and configuration have been checked.' > firmware-output/README.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: roadster-minmax-hw31-candidate
+          path: firmware-output/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: roadster-build-log
+          path: build-roadster.log
+          if-no-files-found: ignore
