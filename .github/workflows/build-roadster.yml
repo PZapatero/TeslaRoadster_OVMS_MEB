@@ -1,7 +1,7 @@
 name: Build Roadster min-max firmware
 on:
   push:
-    branches: [teslaroadster-meb]
+    branches: [roadster-3.3.006-minmax]
     paths: [.github/workflows/build-roadster.yml]
   workflow_dispatch:
 permissions:
@@ -22,6 +22,17 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
+      - name: Check out the installed firmware base for this build
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show HEAD:patches/roadster-ess-minmax.patch > "$RUNNER_TEMP/roadster-ess-minmax.patch"
+          git rev-parse HEAD > "$RUNNER_TEMP/extension-source-commit.txt"
+          git remote add ovms https://github.com/openvehicles/Open-Vehicle-Monitoring-System-3.git
+          git fetch --no-tags ovms 362f8742592b8b6bb9fa4238bd6fe0983868eced
+          git checkout --detach 362f8742592b8b6bb9fa4238bd6fe0983868eced
+          git apply "$RUNNER_TEMP/roadster-ess-minmax.patch"
+          git submodule update --init --recursive
       - name: Verify min-max decoder
         run: |
           cd vehicle/OVMS.V3/components/vehicle_teslaroadster
@@ -46,12 +57,14 @@ jobs:
           mkdir -p firmware-output
           cp vehicle/OVMS.V3/build/ovms3.bin firmware-output/ovms3-roadster-minmax-hw31.bin
           cp vehicle/OVMS.V3/sdkconfig firmware-output/sdkconfig.hw31
-          git rev-parse HEAD > firmware-output/source-commit.txt
+          git rev-parse HEAD > firmware-output/base-source-commit.txt
+          cp "$RUNNER_TEMP/extension-source-commit.txt" firmware-output/extension-source-commit.txt
+          cp "$RUNNER_TEMP/roadster-ess-minmax.patch" firmware-output/roadster-ess-minmax.patch
           sha256sum firmware-output/*.bin > firmware-output/SHA256SUMS
           printf '%s\n' 'Build candidate for OVMS hardware 3.1 / 16 MB flash.' 'Hardware and installed firmware compatibility have not been verified on the vehicle.' 'Do not flash until the device version and configuration have been checked.' > firmware-output/README.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: roadster-minmax-hw31-candidate
+          name: roadster-3.3.006-minmax-hw31-candidate
           path: firmware-output/
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
